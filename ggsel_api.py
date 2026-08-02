@@ -1,382 +1,512 @@
+import hashlib
+import logging
+import threading
+import time
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import hashlib
-import time
-import threading
-import json
-import logging
-from typing import Dict, List, Optional, Any
+
 from config import Config
-from database import Chat, Message
+from database import Chat
+
+
+class APIFailure(str, Enum):
+    """Machine-readable classification for the most recent API failure."""
+
+    RETRYABLE = "retryable"
+    PERMANENT = "permanent"
+    AUTHENTICATION = "authentication"
+
 
 class TimeoutSession(requests.Session):
+    """Requests session that applies the configured timeout to every call."""
+
+    def __init__(self, default_timeout: Tuple[float, float]):
+        super().__init__()
+        self.default_timeout = default_timeout
+
     def request(self, *args, **kwargs):
-        # Force a strict 15-second timeout on all requests
-        kwargs.setdefault('timeout', 15)
+        kwargs.setdefault("timeout", self.default_timeout)
         return super().request(*args, **kwargs)
 
-def create_ggsel_session(max_retries: int = 3):
-    """Create a persistent, self-healing session with strict timeouts."""
-    session = TimeoutSession()
 
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'Connection': 'keep-alive'
-    })
-
-    retries = Retry(
-        total=max(0, max_retries),
-        backoff_factor=1,
-        status_forcelist=[500, 502, 503, 504],
-        # Retrying message POST requests can deliver duplicate replies.
-        allowed_methods=["HEAD", "GET", "OPTIONS"]
+def create_ggsel_session(
+    max_retries: int = 3,
+    timeout: Tuple[float, float] = (5.0, 30.0),
+) -> TimeoutSession:
+    """Create a persistent session that never retries customer-message POSTs."""
+    session = TimeoutSession(timeout)
+    session.headers.update(
+        {
+            "User-Agent": "GGSel-Seller-Helper/1.1",
+            "Accept": "application/json",
+            "Connection": "keep-alive",
+        }
     )
-    
-    adapter = requests.adapters.HTTPAdapter(max_retries=retries)
-    session.mount("http://", adapter)
+
+    retry_count = max(0, int(max_retries))
+    retries = Retry(
+        total=retry_count,
+        connect=retry_count,
+        read=retry_count,
+        status=retry_count,
+        backoff_factor=0.5,
+        status_forcelist=(408, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
     session.mount("https://", adapter)
-    
     return session
 
+
 class GGSelAPI:
-    def __init__(self, config):
+    DEFAULT_TIMEOUT: Tuple[float, float] = (5.0, 30.0)
+    MAX_MESSAGE_LENGTH = 4000
+    RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+    def __init__(self, config: Config):
         self.config = config
-        self.base_url = config.ggsel_base_url
+        self.base_url = self._validated_base_url(config.ggsel_base_url)
+        self.timeout = self._validated_timeout(
+            getattr(config, "ggsel_connect_timeout", self.DEFAULT_TIMEOUT[0]),
+            getattr(config, "ggsel_read_timeout", self.DEFAULT_TIMEOUT[1]),
+        )
         self.token: Optional[str] = None
+        self.last_failure: Optional[APIFailure] = None
         self._session_local = threading.local()
-        self.session = create_ggsel_session(config.max_retries)
         self._login_lock = threading.Lock()
         self._auth_blocked_until = 0.0
+        self.session = self._new_session()
+
+    def _new_session(self) -> TimeoutSession:
+        return create_ggsel_session(self.config.max_retries, self.timeout)
 
     @property
-    def session(self):
-        session = getattr(self._session_local, 'session', None)
+    def session(self) -> TimeoutSession:
+        session = getattr(self._session_local, "session", None)
         if session is None:
-            session = create_ggsel_session(self.config.max_retries)
+            session = self._new_session()
             self._session_local.session = session
         return session
 
     @session.setter
-    def session(self, value):
+    def session(self, value: TimeoutSession) -> None:
         self._session_local.session = value
 
+    def _replace_session(self) -> None:
+        try:
+            self.session.close()
+        finally:
+            self.session = self._new_session()
+
+    @staticmethod
+    def _validated_base_url(value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("GGSEL_BASE_URL must be a non-empty HTTPS URL")
+        parsed = urlsplit(value.strip())
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "GGSEL_BASE_URL must be HTTPS without credentials, query, or fragment"
+            )
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("GGSEL_BASE_URL contains an invalid port") from exc
+
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+        rendered_host = f"[{host}]" if ":" in host else host
+        netloc = f"{rendered_host}:{port}" if port is not None else rendered_host
+        return urlunsplit(("https", netloc, parsed.path.rstrip("/"), "", ""))
+
+    @staticmethod
+    def _validated_timeout(connect: Any, read: Any) -> Tuple[float, float]:
+        try:
+            timeout = (float(connect), float(read))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("GGSel HTTP timeouts must be numeric") from exc
+        if any(value <= 0 or value > 300 for value in timeout):
+            raise ValueError("GGSel HTTP timeouts must be greater than 0 and at most 300 seconds")
+        return timeout
+
+    @staticmethod
+    def _positive_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}/{path.lstrip('/')}"
+
     def _generate_sign(self, timestamp: str) -> str:
-        """Генерация подписи"""
         data = f"{self.config.ggsel_api_key}{timestamp}"
         return hashlib.sha256(data.encode()).hexdigest()
 
+    def _set_http_failure(self, status_code: int) -> None:
+        if status_code in (401, 403):
+            self.last_failure = APIFailure.AUTHENTICATION
+        elif status_code in self.RETRYABLE_STATUS_CODES:
+            self.last_failure = APIFailure.RETRYABLE
+        else:
+            self.last_failure = APIFailure.PERMANENT
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> Optional[requests.Response]:
+        kwargs["timeout"] = self.timeout
+        try:
+            response = self.session.request(method, self._url(path), **kwargs)
+        except (requests.Timeout, requests.ConnectionError):
+            self.last_failure = APIFailure.RETRYABLE
+            logging.warning("GGSel API request failed due to a temporary transport error")
+            return None
+        except requests.RequestException:
+            self.last_failure = APIFailure.PERMANENT
+            logging.warning("GGSel API request failed before receiving a response")
+            return None
+
+        if not 200 <= response.status_code < 300:
+            self._set_http_failure(response.status_code)
+            logging.warning("GGSel API returned HTTP %s", response.status_code)
+            return None
+        return response
+
+    def _json(self, response: requests.Response) -> Optional[Any]:
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            self.last_failure = APIFailure.PERMANENT
+            return None
+
     def login(self) -> bool:
-        """Авторизация"""
-        # Several background jobs can discover an expired token together. Only
-        # one of them should hit the login endpoint.
         with self._login_lock:
             return self._login_locked()
 
     def _login_locked(self) -> bool:
         current_time = time.monotonic()
-
         if current_time < self._auth_blocked_until:
             return False
 
         timestamp = str(int(time.time()))
-        sign = self._generate_sign(timestamp)
-        payload = {"seller_id": self.config.ggsel_seller_id, "timestamp": timestamp, "sign": sign}
-
-        try:
-            response = self.session.post(f"{self.base_url}/apilogin", json=payload, timeout=15)
-
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict) and 'token' in data:
-                    self.token = data['token']
-                    self._auth_blocked_until = 0.0
-                    return True
-                    
-            # Explicit check just in case the retry adapter doesn't catch the 503 first
-            elif response.status_code in [502, 503, 504]:
-                logging.error(f"GGSel Server Error ({response.status_code}). WAF block likely. Enforcing 300s cooldown.")
-                self.session.close()
-                self.session = create_ggsel_session(self.config.max_retries)
+        response = self._request(
+            "POST",
+            "apilogin",
+            headers={"Content-Type": "application/json"},
+            json={
+                "seller_id": self.config.ggsel_seller_id,
+                "timestamp": timestamp,
+                "sign": self._generate_sign(timestamp),
+            },
+        )
+        if response is None:
+            self.token = None
+            if self.last_failure == APIFailure.RETRYABLE:
                 self._auth_blocked_until = current_time + 300
-                return False
+                self._replace_session()
+            else:
+                self._auth_blocked_until = current_time + max(10, self.config.retry_delay)
+            return False
 
+        data = self._json(response)
+        token = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            self.token = None
+            self.last_failure = APIFailure.PERMANENT
             self._auth_blocked_until = current_time + max(10, self.config.retry_delay)
             return False
 
-        except Exception as e:
-            if "RemoteDisconnected" not in str(e):
-                logging.error(f"Ошибка авторизации (GGSel API is down): {e}")
+        self.token = token.strip()
+        self.last_failure = None
+        self._auth_blocked_until = 0.0
+        return True
 
-            # Destroy corrupted session pool and rebuild
-            self.session.close()
-            self.session = create_ggsel_session(self.config.max_retries)
-
-            # If GGSel blocked the connection or timed out, enforce the 5-minute cooldown
-            if "Max retries" in str(e) or "Timeout" in str(e) or "503" in str(e):
-                logging.warning("Applying 300-second firewall cooldown to prevent permanent IP ban.")
-                self._auth_blocked_until = current_time + 300
-            else:
-                self._auth_blocked_until = current_time + max(10, self.config.retry_delay)
-                
-            return False
-
-    def get_chats(self, filter_new: Optional[int] = None, email: Optional[str] = None, 
-                  id_ds: Optional[str] = None, pagesize: int = 100, page: int = 1) -> Optional[Dict[str, Any]]:
-        """Получение чатов"""
-        if not self.token and not self.login(): 
+    def _authenticated_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Optional[requests.Response]:
+        if not self.token and not self.login():
             return None
-            
-        params = {'token': self.token, 'pagesize': pagesize, 'page': page}
-        if filter_new is not None: params['filter_new'] = filter_new
-        if email: params['email'] = email
-        if id_ds: params['id_ds'] = id_ds
 
-        try:
-            response = self.session.get(f"{self.base_url}/debates/v2/chats", params=params, timeout=15)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException:
-            if self.login(): 
-                try:
-                    params['token'] = self.token
-                    response = self.session.get(f"{self.base_url}/debates/v2/chats", params=params, timeout=15)
-                    response.raise_for_status()
-                    return response.json()
-                except: pass
+        request_params = dict(params or {})
+        request_params["token"] = self.token
+        response = self._request(method, path, params=request_params, **kwargs)
+        if response is None and self.last_failure == APIFailure.AUTHENTICATION:
+            self.token = None
+            if self.login():
+                request_params["token"] = self.token
+                response = self._request(method, path, params=request_params, **kwargs)
+        return response
+
+    def get_chats(
+        self,
+        filter_new: Optional[int] = None,
+        email: Optional[str] = None,
+        id_ds: Optional[str] = None,
+        pagesize: int = 100,
+        page: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(pagesize, int) or not 1 <= pagesize <= 1000:
+            self.last_failure = APIFailure.PERMANENT
             return None
+        if not isinstance(page, int) or page < 1:
+            self.last_failure = APIFailure.PERMANENT
+            return None
+
+        params: Dict[str, Any] = {"pagesize": pagesize, "page": page}
+        if filter_new is not None:
+            params["filter_new"] = filter_new
+        if email:
+            params["email"] = email
+        if id_ds:
+            params["id_ds"] = id_ds
+
+        response = self._authenticated_request("GET", "debates/v2/chats", params=params)
+        data = self._json(response) if response is not None else None
+        if isinstance(data, dict):
+            self.last_failure = None
+            return data
+        if response is not None:
+            self.last_failure = APIFailure.PERMANENT
+        return None
 
     def get_chat_messages(self, chat_id: int) -> Optional[List[Dict[str, Any]]]:
-        """Получение сообщений чата"""
-        if not self.token and not self.login(): 
+        chat_id = self._positive_int(chat_id)
+        if chat_id is None:
+            self.last_failure = APIFailure.PERMANENT
             return None
-            
-        params = {'token': self.token, 'id_i': chat_id}
-        
-        try:
-            response = self.session.get(f"{self.base_url}/debates/v2", params=params, timeout=15)
-            response.raise_for_status()
-        except requests.RequestException:
-            if self.login(): 
-                try:
-                    params['token'] = self.token
-                    response = self.session.get(f"{self.base_url}/debates/v2", params=params, timeout=15)
-                    response.raise_for_status()
-                except: return None
-            else: return None
-            
-        try:
-            data = response.json()
-            if isinstance(data, list): return data
-            elif isinstance(data, dict) and 'messages' in data: return data['messages']
-            return []
-        except: 
+        response = self._authenticated_request(
+            "GET", "debates/v2", params={"id_i": chat_id}
+        )
+        data = self._json(response) if response is not None else None
+        messages = data if isinstance(data, list) else data.get("messages") if isinstance(data, dict) else None
+        if isinstance(messages, list) and all(isinstance(item, dict) for item in messages):
+            self.last_failure = None
+            return messages
+        if response is not None:
+            self.last_failure = APIFailure.PERMANENT
+        return None
+
+    @staticmethod
+    def _clean_message(message: Any) -> Optional[str]:
+        if not isinstance(message, str):
             return None
+        cleaned = "".join(char for char in message if char in "\n\r\t" or ord(char) >= 32)
+        if not cleaned.strip():
+            return None
+        return cleaned[:GGSelAPI.MAX_MESSAGE_LENGTH]
 
     def send_message(self, chat_id: int, message: str) -> bool:
-        """Отправка сообщения"""
-        if not self.token and not self.login(): 
+        chat_id = self._positive_int(chat_id)
+        if chat_id is None:
+            self.last_failure = APIFailure.PERMANENT
             return False
-            
-        if len(message) > 4000: message = message[:4000]
-        
-        url = f"{self.base_url}/debates/v2"
-        params = {'token': self.token, 'id_i': chat_id}
-        
-        safe_message = message if message else "💬" 
-        payload = {'message': safe_message, 'text': safe_message}
-            
-        try:
-            response = self.session.post(url, params=params, json=payload, timeout=30)
-            if response.status_code == 200:
-                try:
-                    return response.json().get('retval') == 0
-                except json.JSONDecodeError:
-                    return True
+        cleaned = self._clean_message(message)
+        if cleaned is None:
+            self.last_failure = APIFailure.PERMANENT
             return False
-            
-        except requests.exceptions.ReadTimeout:
-            logging.warning(f"Timeout on chat {chat_id}: Message likely sent, but GGSel is slow.")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Ошибка отправки: {e}")
+        if not self.token and not self.login():
             return False
-    
-    def get_last_sales(self, top: int = 10) -> Optional[Dict[str, Any]]:
-        """Получение продаж"""
-        if not self.token and not self.login():
-            return None
-        
-        url = f"{self.base_url}/seller-last-sales"
-        params = {'token': self.token, 'top': top}
-        headers = {'Accept': 'application/json', 'locale': 'ru'}
-        
-        try:
-            response = self.session.get(url, params=params, headers=headers)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException:
-            if self.login():
-                try:
-                    params['token'] = self.token
-                    response = self.session.get(url, params=params, headers=headers)
-                    response.raise_for_status()
-                    return response.json()
-                except:
-                    pass
-            return None
-    
-    def get_purchase_info(self, invoice_id: int) -> Optional[Dict[str, Any]]:
-        """Получение информации о покупке"""
-        if not self.token and not self.login():
-            return None
-        
-        url = f"{self.base_url}/purchase/info/{invoice_id}?token={self.token}"
-        headers = {'Accept': 'application/json'}
-        
-        try:
-            response = self.session.get(url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('retval') == 0:
-                    return data
-            return None
-        except requests.RequestException:
-            if self.login():
-                try:
-                    url = f"{self.base_url}/purchase/info/{invoice_id}?token={self.token}"
-                    response = self.session.get(url, headers=headers, timeout=30)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data.get('retval') == 0:
-                            return data
-                except:
-                    pass
-            return None
-    
-    def get_chats_by_email(self, email: str, pagesize: int = 100, page: int = 1) -> Optional[Dict[str, Any]]:
-        """Получение чатов по email"""
-        if not self.token and not self.login():
-            return None
-        
-        params = {'token': self.token, 'email': email, 'pagesize': pagesize, 'page': page}
-        
-        try:
-            response = self.session.get(f"{self.base_url}/debates/v2/chats", params=params)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException:
-            if self.login():
-                try:
-                    params['token'] = self.token
-                    response = self.session.get(f"{self.base_url}/debates/v2/chats", params=params)
-                    response.raise_for_status()
-                    return response.json()
-                except:
-                    pass
-            return None
-    
-    def parse_chats_response(self, response_data: Dict[str, Any]) -> List[Chat]:
-        """Парсинг чатов"""
-        chats = []
-        if 'items' in response_data:
-            for item in response_data['items']:
-                id_i = item.get('id_i')
-                if id_i is None:
-                    continue
-                
-                chat = Chat(
-                    id_i=id_i,
-                    email=item.get('email') or None,
-                    product=item.get('product', 0),
-                    last_message=item.get('last_message', ''),
-                    cnt_msg=item.get('cnt_msg', 0),
-                    cnt_new=item.get('cnt_new', 0)
+
+        for attempt in range(2):
+            try:
+                response = self.session.request(
+                    "POST",
+                    self._url("debates/v2"),
+                    params={"token": self.token, "id_i": chat_id},
+                    json={"message": cleaned, "text": cleaned},
+                    timeout=self.timeout,
                 )
-                chats.append(chat)
-        return chats
-    
-    def get_reviews(self, count: int = 20, review_type: str = "all", page: int = 1, product_id: int = None) -> Optional[Dict[str, Any]]:
-        """Получение отзывов"""
-        if not self.token and not self.login():
-            return None
-        
-        url = "https://seller.ggsel.com/api_sellers/api/reviews"
-        params = {
-            'token': self.token,
-            'type': review_type,
-            'page': page,
-            'count': count
-        }
-        if product_id:
-            params['product_id'] = product_id
-            
-        headers = {'Accept': 'application/json', 'locale': 'ru-RU'}
-        
-        try:
-            response = self.session.get(url, params=params, headers=headers, timeout=30)
-            if response.status_code == 200:
+            except requests.ReadTimeout:
+                # The server may already have accepted the message. Treat the
+                # ambiguous result as delivered to avoid duplicate replies.
+                self.last_failure = None
+                logging.warning("GGSel message response timed out; suppressing duplicate retry")
+                return True
+            except (requests.Timeout, requests.ConnectionError):
+                self.last_failure = APIFailure.RETRYABLE
+                return False
+            except requests.RequestException:
+                self.last_failure = APIFailure.PERMANENT
+                return False
+
+            if response.status_code in (401, 403) and attempt == 0:
+                self.token = None
+                self.last_failure = APIFailure.AUTHENTICATION
+                if self.login():
+                    continue
+                return False
+            if not 200 <= response.status_code < 300:
+                self._set_http_failure(response.status_code)
+                return False
+
+            try:
                 data = response.json()
-                if data.get('retval') == 0:
-                    return data
+            except (ValueError, TypeError):
+                data = None
+            if isinstance(data, dict) and "retval" in data and data.get("retval") != 0:
+                self.last_failure = APIFailure.PERMANENT
+                return False
+            self.last_failure = None
+            return True
+        return False
+
+    def get_last_sales(self, top: int = 10) -> Optional[Dict[str, Any]]:
+        if not isinstance(top, int) or not 1 <= top <= 1000:
+            self.last_failure = APIFailure.PERMANENT
             return None
-        except requests.RequestException as e:
-            logging.debug(f"Ошибка получения отзывов: {e}")
-            if self.login():
-                try:
-                    params['token'] = self.token
-                    response = self.session.get(url, params=params, headers=headers, timeout=30)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data.get('retval') == 0:
-                            return data
-                except:
-                    pass
+        response = self._authenticated_request(
+            "GET",
+            "seller-last-sales",
+            params={"top": top},
+            headers={"Accept": "application/json", "locale": "ru"},
+        )
+        data = self._json(response) if response is not None else None
+        if isinstance(data, dict):
+            self.last_failure = None
+            return data
+        return None
+
+    def get_balance_info(self) -> Optional[Dict[str, Any]]:
+        response = self._authenticated_request(
+            "GET",
+            "sellers/account/balance/info",
+            headers={"Accept": "application/json"},
+        )
+        data = self._json(response) if response is not None else None
+        if isinstance(data, dict):
+            self.last_failure = None
+            return data
+        return None
+
+    def get_purchase_info(self, invoice_id: int) -> Optional[Dict[str, Any]]:
+        invoice_id = self._positive_int(invoice_id)
+        if invoice_id is None:
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        response = self._authenticated_request(
+            "GET",
+            f"purchase/info/{invoice_id}",
+            headers={"Accept": "application/json", "locale": "ru"},
+        )
+        data = self._json(response) if response is not None else None
+        if isinstance(data, dict) and data.get("retval") == 0:
+            self.last_failure = None
+            return data
+        if response is not None:
+            self.last_failure = APIFailure.PERMANENT
+        return None
+
+    def get_chats_by_email(
+        self, email: str, pagesize: int = 100, page: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(email, str) or not email.strip():
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        return self.get_chats(email=email.strip(), pagesize=pagesize, page=page)
+
+    def parse_chats_response(self, response_data: Dict[str, Any]) -> List[Chat]:
+        chats = []
+        if not isinstance(response_data, dict):
+            return chats
+        for item in response_data.get("items", []):
+            if not isinstance(item, dict) or item.get("id_i") is None:
+                continue
+            chats.append(
+                Chat(
+                    id_i=item["id_i"],
+                    email=item.get("email") or None,
+                    product=item.get("product", 0),
+                    last_message=item.get("last_message", ""),
+                    cnt_msg=item.get("cnt_msg", 0),
+                    cnt_new=item.get("cnt_new", 0),
+                )
+            )
+        return chats
+
+    def get_reviews(
+        self,
+        count: int = 20,
+        review_type: str = "all",
+        page: int = 1,
+        product_id: int = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(count, int) or not 1 <= count <= 100:
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        if not isinstance(page, int) or page < 1:
+            self.last_failure = APIFailure.PERMANENT
             return None
 
+        params: Dict[str, Any] = {
+            "type": review_type,
+            "page": page,
+            "count": count,
+        }
+        if product_id:
+            params["product_id"] = product_id
+        response = self._authenticated_request(
+            "GET",
+            "reviews",
+            params=params,
+            headers={"Accept": "application/json", "locale": "ru-RU"},
+        )
+        data = self._json(response) if response is not None else None
+        if isinstance(data, dict) and data.get("retval") == 0:
+            self.last_failure = None
+            return data
+        if response is not None:
+            self.last_failure = APIFailure.PERMANENT
+        return None
+
     def get_review_by_invoice(self, invoice_id: int) -> Optional[Dict[str, Any]]:
-        """Поиск отзыва по invoice_id"""
-        for page in range(1, 20): 
+        target = str(invoice_id)
+        for page in range(1, 20):
             data = self.get_reviews(count=50, page=page)
             if not data:
                 break
-            
-            reviews = data.get('reviews', [])
+            reviews = data.get("reviews", [])
             if not reviews:
                 break
-            
             for review in reviews:
-                if review.get('invoice_id') == invoice_id:
+                if isinstance(review, dict) and str(review.get("invoice_id")) == target:
                     return review
-        
         return None
-        
+
     def get_real_product_name(self, item_id: int) -> Optional[str]:
-        """Fetches product info via the official GGSel API to determine the real name."""
-        if not item_id:
+        """Fetch a product name without placing the auth token in the URL."""
+        item_id = self._positive_int(item_id)
+        if item_id is None:
+            self.last_failure = APIFailure.PERMANENT
             return None
-            
-        url = f"https://seller.ggsel.com/api_sellers/api/products/{item_id}/data"
-        params = {"token": self.token}
-        
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                product_data = data.get('product')
-                
-                if product_data and 'name' in product_data:
-                    clean_name = str(product_data['name']).strip()
-                    return clean_name
-                else:
-                    logging.warning(f"Product 'name' key missing in API response for {item_id}")
-            else:
-                logging.error(f"Official API fetch failed with HTTP {response.status_code}")
-        except Exception as e:
-            logging.error(f"API fetch exception for {item_id}: {e}")
-            
+        response = self._authenticated_request(
+            "GET",
+            f"products/{item_id}/data",
+            headers={"Accept": "application/json"},
+        )
+        data = self._json(response) if response is not None else None
+        product = data.get("product") if isinstance(data, dict) else None
+        name = product.get("name") if isinstance(product, dict) else None
+        if isinstance(name, str) and name.strip():
+            self.last_failure = None
+            return name.strip()
+        if response is not None:
+            self.last_failure = APIFailure.PERMANENT
         return None

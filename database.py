@@ -64,6 +64,12 @@ class Database:
             conn.execute('CREATE TABLE IF NOT EXISTS processed_reviews (review_id TEXT PRIMARY KEY, hash TEXT)')
             conn.execute('CREATE TABLE IF NOT EXISTS pending_topics (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)')
             conn.execute('''
+                CREATE TABLE IF NOT EXISTS service_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            ''')
+            conn.execute('''
                 CREATE TABLE IF NOT EXISTS telegram_outbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     dedupe_key TEXT UNIQUE,
@@ -83,6 +89,25 @@ class Database:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_delivery ON messages(chat_id, is_sent_to_telegram)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_outbox_due ON telegram_outbox(next_attempt_at, id)')
+
+    def get_setting(self, key: str) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT value FROM service_settings WHERE key = ?',
+                (key,),
+            ).fetchone()
+            return str(row[0]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO service_settings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                ''',
+                (key, str(value)),
+            )
             
     def save_chat(self, chat: Chat) -> None:
         with self._connect() as conn:

@@ -18,8 +18,10 @@ class TelegramBot:
         self.callback_handler = None 
         self.general_message_handler = None
         self.history_handler = None 
-        self.options_handler = None 
-        self.review_handler = None 
+        self.options_handler = None
+        self.review_handler = None
+        self.start_sync_handler = None
+        self.stop_sync_handler = None
         
     def set_topic_message_handler(self, h): self.topic_message_handler = h
     def set_callback_handler(self, h): self.callback_handler = h
@@ -27,6 +29,8 @@ class TelegramBot:
     def set_history_handler(self, h): self.history_handler = h
     def set_options_handler(self, h): self.options_handler = h
     def set_review_handler(self, h): self.review_handler = h
+    def set_start_sync_handler(self, h): self.start_sync_handler = h
+    def set_stop_sync_handler(self, h): self.stop_sync_handler = h
 
     @staticmethod
     def _retry_seconds(value) -> float:
@@ -45,6 +49,8 @@ class TelegramBot:
             self.application.add_handler(CommandHandler("history", self._handle_history_command))
             self.application.add_handler(CommandHandler("options", self._handle_options_command))
             self.application.add_handler(CommandHandler("review", self._handle_review_command))
+            self.application.add_handler(CommandHandler("start_sync", self._handle_start_sync_command))
+            self.application.add_handler(CommandHandler("stop_sync", self._handle_stop_sync_command))
             self.application.add_handler(CallbackQueryHandler(self._handle_callback))
             
             if self.topic_message_handler:
@@ -206,3 +212,13 @@ class TelegramBot:
     async def _handle_review_command(self, update: Update, context):
         if update.effective_chat.id == self.group_id and update.message.message_thread_id and self.review_handler:
             await self.review_handler(update.message.message_thread_id)
+
+    async def _handle_start_sync_command(self, update: Update, context):
+        if update.effective_chat.id != self.group_id or not self.start_sync_handler:
+            return
+        await update.message.reply_text(await self.start_sync_handler())
+
+    async def _handle_stop_sync_command(self, update: Update, context):
+        if update.effective_chat.id != self.group_id or not self.stop_sync_handler:
+            return
+        await update.message.reply_text(await self.stop_sync_handler())

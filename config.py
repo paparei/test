@@ -30,14 +30,18 @@ class Config:
     chat_check_interval: int = 40  # секунды для проверки новых чатов
     review_check_interval: int = 120
     topic_sync_interval: int = 3600
-    
+
     # Настройки таймаутов и повторных попыток
     telegram_timeout: int = 30  # таймаут для Telegram API
     max_retries: int = 3  # максимальное количество повторных попыток
     retry_delay: int = 5  # задержка между попытками в секундах
-    
+
     # Автообновление
     auto_update: bool = False  # opt in after validating an update in production
+
+    # GGSel transport settings. Kept after existing fields for positional compatibility.
+    ggsel_connect_timeout: float = 5.0
+    ggsel_read_timeout: float = 30.0
     
     @classmethod
     def from_env(cls) -> 'Config':
@@ -54,5 +58,7 @@ class Config:
             telegram_timeout=int(os.getenv('TELEGRAM_TIMEOUT', '30')),
             max_retries=int(os.getenv('MAX_RETRIES', '3')),
             retry_delay=int(os.getenv('RETRY_DELAY', '5')),
+            ggsel_connect_timeout=float(os.getenv('GGSEL_CONNECT_TIMEOUT', '5')),
+            ggsel_read_timeout=float(os.getenv('GGSEL_READ_TIMEOUT', '30')),
             auto_update=os.getenv('AUTO_UPDATE', 'false').lower() in ('true', '1', 'yes')
         )
