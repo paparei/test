@@ -1,7 +1,7 @@
 import asyncio
+import html
 import json
 import os
-import sqlite3
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -17,7 +17,7 @@ from purchase_manager import PurchaseManager, Purchase
 from locales import locales, _
 from autoresponder import AutoResponder
 
-_executor = ThreadPoolExecutor(max_workers=20)
+_executor = ThreadPoolExecutor(max_workers=10)
 
 class BotService:
     def __init__(self, config: Config):
@@ -39,13 +39,17 @@ class BotService:
         self.auth_interval = 15 * 60
         self.flood_control_until = None
         self.message_flood_control_until = None
-        self.pending_messages = []
         self.pending_topics = []
         self.pending_history_loads = []
         self.awaiting_input = {}
         self.processed_reviews = {}
         self.failed_topics = {}
         self.chat_locks = {}
+        self._topic_creation_locks = {}
+        self._auth_lock = asyncio.Lock()
+        self._review_lock = asyncio.Lock()
+        self._tasks = []
+        self._stopping = False
         
         self._load_pending_topics()
         self._load_processed_reviews()
@@ -63,7 +67,7 @@ class BotService:
     # --- SQLite Replaced JSON Stores ---
     def _load_processed_reviews(self):
         try:
-            with sqlite3.connect(self.database.db_path) as conn:
+            with self.database._connect() as conn:
                 cursor = conn.execute("SELECT review_id, hash FROM processed_reviews")
                 self.processed_reviews = {row[0]: row[1] for row in cursor.fetchall()}
                 if self.processed_reviews:
@@ -74,14 +78,14 @@ class BotService:
     def _save_processed_review_db(self, review_id: str, hash_val: str):
         self.processed_reviews[review_id] = hash_val
         try:
-            with sqlite3.connect(self.database.db_path) as conn:
+            with self.database._connect() as conn:
                 conn.execute("INSERT OR REPLACE INTO processed_reviews (review_id, hash) VALUES (?, ?)", (review_id, hash_val))
         except Exception as e:
             logging.error(f"Error saving review to DB: {e}")
 
     def _load_pending_topics(self):
         try:
-            with sqlite3.connect(self.database.db_path) as conn:
+            with self.database._connect() as conn:
                 cursor = conn.execute("SELECT data FROM pending_topics")
                 for row in cursor.fetchall():
                     item = json.loads(row[0])
@@ -98,7 +102,7 @@ class BotService:
 
     def _save_pending_topics(self):
         try:
-            with sqlite3.connect(self.database.db_path) as conn:
+            with self.database._connect() as conn:
                 conn.execute("DELETE FROM pending_topics")
                 for item in self.pending_topics:
                     data_to_save = {
@@ -121,47 +125,28 @@ class BotService:
         self.telegram_bot.set_options_handler(self.handle_options_command)
         self.telegram_bot.set_review_handler(self.handle_review_command)
         
-        await self.telegram_bot.start()
+        if not await self.telegram_bot.start():
+            raise RuntimeError("Telegram bot failed to initialize")
         self.running = True
         logging.info("Bot started and ready on Telegram (0.1s)!")
-        
-        asyncio.create_task(self._background_boot_sequence())
-        
-        # --- ADD THE BALANCE MONITOR TO THIS LIST ---
-        tasks = [
+
+        self._tasks = [
             asyncio.create_task(self.monitor_messages()),
+            asyncio.create_task(self.review_monitor_loop()),
+            asyncio.create_task(self.topic_sync_loop()),
             asyncio.create_task(self.reauth_scheduler()),
             asyncio.create_task(self.purchase_checker()),
             asyncio.create_task(self.balance_monitor_loop()), 
-            asyncio.create_task(self.update_exchange_rate_loop()) # <-- ADD THIS LINE
+            asyncio.create_task(self.update_exchange_rate_loop())
         ]
         
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*self._tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
-            if self.running:
-                await self.stop()
+            await self.stop()
 
-    async def _background_boot_sequence(self):
-        """Background tasks loaded safely without blocking Telegram UI"""
-        if not await self.ensure_ggsel_auth(): return
-        await self.test_reviews_api()
-        await self.process_pending_topics()
-    
-    async def test_reviews_api(self):
-        try:
-            loop = asyncio.get_event_loop()
-            reviews_data = await loop.run_in_executor(_executor, lambda: self.ggsel_api.get_reviews(5))
-            if not reviews_data:
-                logging.warning("Reviews API: no data")
-                return
-            reviews = reviews_data.get('reviews', [])
-            logging.info(f"Reviews API: received {len(reviews)} reviews")
-        except Exception as e:
-            logging.error(f"Error testing Reviews API: {e}")
-    
     def handle_topic_message(self, topic_id: int, message_text: str, username: str, message_id: int):
         asyncio.create_task(self._handle_topic_message_async(topic_id, message_text, username, message_id))
     
@@ -174,8 +159,7 @@ class BotService:
         try:
             if message_text.startswith('/'): return
             
-            all_topics = self.topic_manager.get_all_topics()
-            target_topic = next((info for info in all_topics.values() if info.get('topic_id') == topic_id), None)
+            target_topic = self.topic_manager.get_topic_by_topic_id(topic_id)
             
             if not target_topic: return
             
@@ -202,18 +186,23 @@ class BotService:
         current_time = datetime.now()
         if self.last_auth_time and current_time - self.last_auth_time < timedelta(seconds=self.auth_interval):
             return True
-        loop = asyncio.get_event_loop()
-        success = await loop.run_in_executor(None, self.ggsel_api.login)
-        if success:
-            self.last_auth_time = current_time
-            return True
-        return False
+
+        async with self._auth_lock:
+            current_time = datetime.now()
+            if self.last_auth_time and current_time - self.last_auth_time < timedelta(seconds=self.auth_interval):
+                return True
+            loop = asyncio.get_running_loop()
+            success = await loop.run_in_executor(_executor, self.ggsel_api.login)
+            if success:
+                self.last_auth_time = current_time
+                return True
+            return False
     
     async def purchase_checker(self):
         while self.running:
             try: await self.check_new_purchases()
             except Exception as e: logging.error(f"Purchase check error: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(max(10, self.config.chat_check_interval))
     
     async def check_new_purchases(self):
         if not await self.ensure_ggsel_auth(): return
@@ -247,13 +236,8 @@ class BotService:
             purchase_data = await loop.run_in_executor(None, self.ggsel_api.get_purchase_info, invoice_id)
             
             if not purchase_data:
-                dummy = type('Purchase', (), {
-                    'invoice_id': invoice_id, 'buyer_email': '', 'buyer_account': '', 'name': 'Unknown', 'amount': 0, 
-                    'currency_type': 'USD', 'purchase_date': '', 'date_pay': '', 'buyer_phone': '', 'buyer_ip': '', 
-                    'payment_method': '', 'processed_at': datetime.now().isoformat()
-                })()
-                self.purchase_manager.add_purchase(dummy)
-                logging.warning(f"Failed to get info for purchase {invoice_id}, skipping")
+                self.failed_topics[invoice_id] = datetime.now()
+                logging.warning(f"Failed to get info for purchase {invoice_id}; it will be retried")
                 return
             
             purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
@@ -265,6 +249,11 @@ class BotService:
             logging.error(f"Error processing purchase {invoice_id}: {e}")
     
     async def create_topic_for_purchase(self, purchase: Purchase, skip_greeting: bool = False):
+        lock = self._topic_creation_locks.setdefault(purchase.invoice_id, asyncio.Lock())
+        async with lock:
+            return await self._create_topic_for_purchase_locked(purchase, skip_greeting)
+
+    async def _create_topic_for_purchase_locked(self, purchase: Purchase, skip_greeting: bool = False):
         """Создание топика для покупки"""
         try:
             failed_time = self.failed_topics.get(purchase.invoice_id)
@@ -315,7 +304,7 @@ class BotService:
                     else:
                         logging.warning(f"Failed to fetch real name, sticking to UUID: {mapped_name}")
 
-                safe_name = mapped_name.replace('<', '').replace('>', '').replace('&', '&amp;')
+                safe_name = html.escape(str(mapped_name))
                 msg += f"{_('noti_product')} {safe_name}\n"
                 if getattr(purchase, 'item_id', 0): msg += f"{_('noti_item_id')} {purchase.item_id}\n"
                 msg += f"{_('noti_invoice')} <a href='{order_link}'>{purchase.invoice_id}</a>\n"
@@ -350,15 +339,15 @@ class BotService:
                 
                 # Buyer Info Block
                 msg += f"\n👤 <b>{_('noti_buyer_info')}</b>\n"
-                if purchase.payment_method: msg += f"{_('noti_payment')} {purchase.payment_method}\n"
-                if purchase.buyer_account: msg += f"{_('noti_account')} {purchase.buyer_account}\n"
-                if purchase.buyer_email: msg += f"{_('noti_email')} {purchase.buyer_email}\n"
-                if getattr(purchase, 'payment_aggregator', ''): msg += f"{_('noti_aggregator')} {purchase.payment_aggregator}\n"
+                if purchase.payment_method: msg += f"{_('noti_payment')} {html.escape(str(purchase.payment_method))}\n"
+                if purchase.buyer_account: msg += f"{_('noti_account')} {html.escape(str(purchase.buyer_account))}\n"
+                if purchase.buyer_email: msg += f"{_('noti_email')} {html.escape(str(purchase.buyer_email))}\n"
+                if getattr(purchase, 'payment_aggregator', ''): msg += f"{_('noti_aggregator')} {html.escape(str(purchase.payment_aggregator))}\n"
                 
                 # Options Block
                 options_text, options_list = await self.get_purchase_options_with_list(purchase.invoice_id)
                 if options_text: 
-                    safe_options = options_text.replace('<', '').replace('>', '').replace('&', '&amp;')
+                    safe_options = html.escape(options_text)
                     msg += f"\n⚙️ <b>{_('noti_options')}</b>\n{safe_options}\n"
                 
                 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
@@ -381,7 +370,8 @@ class BotService:
                             logging.error(f"Ошибка отправки приветствия: {e}")
                     
             elif cooldown:
-                self.flood_control_until = datetime.now() + timedelta(seconds=cooldown + 5)
+                retry_seconds = self._cooldown_seconds(cooldown, self.config.retry_delay) + 5
+                self.flood_control_until = datetime.now() + timedelta(seconds=retry_seconds)
                 self.pending_topics.append({'purchase': purchase, 'timestamp': datetime.now(), 'skip_greeting': skip_greeting})
                 self._save_pending_topics()
             else:
@@ -467,40 +457,81 @@ class BotService:
                 self._save_pending_topics()
                 break
             await asyncio.sleep(3)
+        self._save_pending_topics()
         await self.process_pending_history_loads()
     
     async def monitor_messages(self):
         logging.info("Starting message monitor")
-        sync_counter = 0
-        review_counter = 0
-        asyncio.create_task(self.sync_topics_with_purchases())
-        asyncio.create_task(self.check_new_reviews())
-        
         while self.running:
             try:
                 await self.process_pending_messages()
                 await self.process_pending_topics()
                 
                 if not await self.ensure_ggsel_auth():
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(max(2, self.config.poll_interval))
                     continue
-                
-                all_topics = self.topic_manager.get_all_topics()
-                purchase_topics = {k: v for k, v in all_topics.items() if k.startswith('purchase_')}
-                if purchase_topics: await self.check_topics_parallel(purchase_topics)
-                
-                review_counter += 1
-                if review_counter >= 3:
-                    review_counter = 0
-                    asyncio.create_task(self.check_new_reviews())
-                
-                sync_counter += 1
-                if sync_counter >= 43200:
-                    sync_counter = 0
-                    asyncio.create_task(self.sync_topics_with_purchases())
-                    
-            except Exception as e: logging.error(f"Monitor error: {e}")
-            await asyncio.sleep(2)
+
+                await self.check_new_message_chats()
+
+            except Exception as e:
+                logging.error(f"Monitor error: {e}")
+            await asyncio.sleep(max(2, self.config.poll_interval))
+
+    async def review_monitor_loop(self):
+        logging.info("Starting review monitor")
+        while self.running:
+            try:
+                await self.check_new_reviews()
+            except Exception as e:
+                logging.error(f"Review monitor error: {e}")
+            await asyncio.sleep(max(60, self.config.review_check_interval))
+
+    async def topic_sync_loop(self):
+        logging.info("Starting topic reconciliation")
+        while self.running:
+            try:
+                await self.sync_topics_with_purchases()
+            except Exception as e:
+                logging.error(f"Topic reconciliation error: {e}")
+            await asyncio.sleep(max(300, self.config.topic_sync_interval))
+
+    async def check_new_message_chats(self):
+        """Fetch only chats that GGsel reports as having unread messages."""
+        loop = asyncio.get_running_loop()
+        changed_chat_ids = set()
+
+        for page in range(1, 21):
+            response = await loop.run_in_executor(
+                _executor,
+                lambda current_page=page: self.ggsel_api.get_chats(
+                    filter_new=1,
+                    pagesize=100,
+                    page=current_page,
+                ),
+            )
+            if not response:
+                break
+
+            items = response.get('items', []) if isinstance(response, dict) else []
+            for item in items:
+                chat_id = item.get('id_i')
+                if chat_id is not None:
+                    changed_chat_ids.add(int(chat_id))
+
+            if len(items) < 100:
+                break
+
+        if not changed_chat_ids:
+            return
+
+        topics = {}
+        for chat_id in changed_chat_ids:
+            topic = self.topic_manager.get_topic_by_invoice(chat_id)
+            if topic and topic.get('topic_id'):
+                topics[f"purchase_{chat_id}"] = topic
+
+        if topics:
+            await self.check_topics_parallel(topics)
     
     async def check_topics_parallel(self, topics: Dict):
         if not topics: return
@@ -557,7 +588,7 @@ class BotService:
                 try:
                     if is_img == 1 and img_url:
                         # If the user sent text WITH the photo, put it in the Telegram caption
-                        caption_text = f"👤 <b>Customer:</b> {content}" if content else ""
+                        caption_text = f"👤 <b>Customer:</b> {html.escape(str(content))}" if content else ""
                         await self.telegram_bot.application.bot.send_photo(
                             chat_id=self.config.telegram_group_id, 
                             message_thread_id=topic_id, 
@@ -572,7 +603,9 @@ class BotService:
                 except Exception as e:
                     logging.error(f"Failed to forward image to Telegram: {e}")
                     # Fallback: If Telegram refuses to download the image, send a clickable link instead
-                    fallback_text = f"🖼 <a href='{img_url}'>Customer sent an image</a>\n{content}" if is_img else content
+                    safe_url = html.escape(str(img_url), quote=True)
+                    safe_content = html.escape(str(content)) if content else ''
+                    fallback_text = f"🖼 <a href='{safe_url}'>Customer sent an image</a>\n{safe_content}" if is_img else safe_content
                     await self.send_message_with_cooldown(fallback_text, topic_id, chat_id, message_id, parse_mode="HTML")
                 
                 # Auto-responder logic (only trigger if there is actual text)
@@ -589,7 +622,7 @@ class BotService:
                                 await self.send_message_with_cooldown(response_text, topic_id)
                             
                             if notify_group:
-                                topic_info = next((info for info in self.topic_manager.get_all_topics().values() if info.get('topic_id') == topic_id), None)
+                                topic_info = self.topic_manager.get_topic_by_topic_id(topic_id)
                                 notify_msg = auto_result.get("notify_text", "") or "🔔 Reply required!"
                                 if topic_info: notify_msg += f"\n📧 {topic_info.get('email', 'N/A')}\n🆔 {topic_info.get('invoice_id', 'N/A')}"
                                 await self.send_message_with_cooldown(notify_msg, topic_id)
@@ -601,35 +634,88 @@ class BotService:
             return False
     
     async def stop(self):
-        if not self.running: return
+        if self._stopping:
+            return
+        self._stopping = True
         logging.info("Stopping bot...")
         self.running = False
         current_task = asyncio.current_task()
-        tasks = [t for t in asyncio.all_tasks() if t is not current_task and not t.done()]
-        for task in tasks: task.cancel()
-        if tasks: await asyncio.gather(*tasks, return_exceptions=True)
-        await self.telegram_bot.stop()
-        logging.info("Bot stopped")
-    
-    async def send_message_with_cooldown(self, text: str, topic_id: int, chat_id: int = None, message_id: str = None, parse_mode: str = None, reply_markup = None) -> bool:
-        """Updated to support reply_markup for clickable order buttons"""
+        tasks = [task for task in self._tasks if task is not current_task and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         try:
-            # SQLite check instead of missing dictionary check
+            await self.telegram_bot.stop()
+        finally:
+            logging.info("Bot stopped")
+
+    @staticmethod
+    def _cooldown_seconds(value, default: float = 5) -> float:
+        if value is None:
+            return default
+        if hasattr(value, 'total_seconds'):
+            value = value.total_seconds()
+        try:
+            return max(1, float(value))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _serialize_reply_markup(reply_markup) -> Optional[str]:
+        if reply_markup is None:
+            return None
+        try:
+            return json.dumps(reply_markup.to_dict(), ensure_ascii=False)
+        except Exception as e:
+            logging.warning(f"Could not persist Telegram keyboard: {e}")
+            return None
+
+    def _deserialize_reply_markup(self, payload: Optional[str]):
+        if not payload:
+            return None
+        try:
+            return InlineKeyboardMarkup.de_json(json.loads(payload), self.telegram_bot.bot)
+        except Exception as e:
+            logging.warning(f"Could not restore Telegram keyboard: {e}")
+            return None
+    
+    async def send_message_with_cooldown(
+        self,
+        text: str,
+        topic_id: int,
+        chat_id: int = None,
+        message_id: str = None,
+        parse_mode: str = None,
+        reply_markup=None,
+        dedupe_key: str = None,
+        _outbox_id: int = None,
+    ) -> bool:
+        """Send immediately when possible and durably queue retryable failures."""
+        try:
             if chat_id and message_id:
-                if self.message_manager.is_message_processed(chat_id, message_id):
-                    # Check if it was already sent to TG in DB
-                    with __import__('sqlite3').connect(self.database.db_path) as conn:
-                        cur = conn.execute("SELECT is_sent_to_telegram FROM messages WHERE message_id = ?", (message_id,))
-                        row = cur.fetchone()
-                        if row and row[0]: return True
+                dedupe_key = dedupe_key or f"chat-message:{chat_id}:{message_id}"
+                if self.database.is_message_sent(message_id):
+                    if _outbox_id:
+                        self.database.delete_telegram_message(_outbox_id)
+                    return True
+
+            outbox_id = _outbox_id
+            if outbox_id is None:
+                outbox_id = self.database.enqueue_telegram_message(
+                    text=text,
+                    topic_id=topic_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode=parse_mode,
+                    reply_markup=self._serialize_reply_markup(reply_markup),
+                    dedupe_key=dedupe_key,
+                )
 
             if self.message_flood_control_until and datetime.now() < self.message_flood_control_until:
-                self.pending_messages.append({
-                    'text': text, 'topic_id': topic_id, 'chat_id': chat_id, 
-                    'message_id': message_id, 'timestamp': datetime.now(), 
-                    'parse_mode': parse_mode, 'reply_markup': reply_markup
-                })
-                return False
+                remaining = (self.message_flood_control_until - datetime.now()).total_seconds()
+                self.database.reschedule_telegram_message(outbox_id, remaining, 'Telegram flood control')
+                return True
             self.message_flood_control_until = None
             
             success, cooldown = await self.telegram_bot.send_message(text, topic_id, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -637,15 +723,18 @@ class BotService:
             if success:
                 if chat_id and message_id:
                     self.message_manager.mark_message_sent(chat_id, message_id)
+                self.database.delete_telegram_message(outbox_id)
                 return True
-                
-            elif cooldown:
-                self.message_flood_control_until = datetime.now() + timedelta(seconds=cooldown + 5)
-                self.pending_messages.append({
-                    'text': text, 'topic_id': topic_id, 'chat_id': chat_id, 
-                    'message_id': message_id, 'timestamp': datetime.now(), 
-                    'parse_mode': parse_mode, 'reply_markup': reply_markup
-                })
+
+            if cooldown is not None:
+                retry_seconds = self._cooldown_seconds(cooldown, self.config.retry_delay) + 5
+                self.message_flood_control_until = datetime.now() + timedelta(seconds=retry_seconds)
+                self.database.reschedule_telegram_message(outbox_id, retry_seconds, 'Retryable Telegram error')
+                return True
+
+            # Bad requests and permission errors will not recover by retrying the
+            # exact same payload forever.
+            self.database.delete_telegram_message(outbox_id)
             return False
                 
         except Exception as e:
@@ -653,20 +742,23 @@ class BotService:
             return False
 
     async def process_pending_messages(self):
-        if not self.pending_messages: return
         if self.message_flood_control_until and datetime.now() < self.message_flood_control_until: return
         self.message_flood_control_until = None
-        
-        messages = self.pending_messages.copy()
-        self.pending_messages.clear()
-        
-        for msg in messages:
-            success = await self.send_message_with_cooldown(
-                msg['text'], msg['topic_id'], msg.get('chat_id'), 
-                msg.get('message_id'), msg.get('parse_mode'), msg.get('reply_markup')
+
+        for msg in self.database.get_due_telegram_messages(limit=100):
+            await self.send_message_with_cooldown(
+                msg['text'],
+                msg['topic_id'],
+                msg.get('chat_id'),
+                msg.get('message_id'),
+                msg.get('parse_mode'),
+                self._deserialize_reply_markup(msg.get('reply_markup')),
+                msg.get('dedupe_key'),
+                msg['id'],
             )
-            if not success and self.message_flood_control_until: break
-            await asyncio.sleep(1)
+            if self.message_flood_control_until:
+                break
+            await asyncio.sleep(0.2)
     
     async def reauth_scheduler(self):
         while self.running:
@@ -675,6 +767,9 @@ class BotService:
     
     def stop_sync(self):
         self.running = False
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
 
     def _safe_parse_idx(self, data: str, prefix: str) -> int:
         try: return int(data.replace(prefix, ""))
@@ -1013,7 +1108,6 @@ class BotService:
     async def sync_topics_with_purchases(self):
         logging.info("Starting topic sync with purchases...")
         if not await self.ensure_ggsel_auth(): return
-        await self.check_deleted_topics()
         
         loop = asyncio.get_event_loop()
         sales_data = await loop.run_in_executor(None, self.ggsel_api.get_last_sales, 30)
@@ -1060,11 +1154,21 @@ class BotService:
             await asyncio.sleep(0.5)
     
     async def check_new_reviews(self):
+        if self._review_lock.locked():
+            return
         try:
-            loop = asyncio.get_event_loop()
-            invoice_to_topic = {int(info['invoice_id']): info for k, info in self.topic_manager.get_all_topics().items() if k.startswith('purchase_') and info.get('invoice_id')}
-            await asyncio.gather(self._check_reviews_by_api(loop, invoice_to_topic), self._check_reviews_by_topics(loop, invoice_to_topic), return_exceptions=True)
-        except Exception as e: logging.error(f"Review check error: {e}")
+            async with self._review_lock:
+                if not await self.ensure_ggsel_auth():
+                    return
+                loop = asyncio.get_running_loop()
+                invoice_to_topic = {
+                    int(info['invoice_id']): info
+                    for key, info in self.topic_manager.get_all_topics().items()
+                    if key.startswith('purchase_') and info.get('invoice_id')
+                }
+                await self._check_reviews_by_api(loop, invoice_to_topic)
+        except Exception as e:
+            logging.error(f"Review check error: {e}")
 
     async def _check_reviews_by_api(self, loop, invoice_to_topic: dict):
         try:
@@ -1083,19 +1187,6 @@ class BotService:
                 await self._process_reviews(all_reviews, invoice_to_topic, loop)
         except Exception as e: logging.error(f"API review check error: {e}")
 
-    async def _check_reviews_by_topics(self, loop, invoice_to_topic: dict):
-        try:
-            semaphore = asyncio.Semaphore(10)
-            async def check_single_invoice(invoice_id: int, topic_info: dict):
-                async with semaphore:
-                    try:
-                        review = await loop.run_in_executor(_executor, lambda inv=invoice_id: self.ggsel_api.get_review_by_invoice(inv))
-                        if review: await self._process_reviews([review], {invoice_id: topic_info}, loop)
-                    except: pass
-            tasks = [check_single_invoice(inv_id, info) for inv_id, info in invoice_to_topic.items()]
-            await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception as e: logging.error(f"Topic review check error: {e}")
-
     async def _process_reviews(self, reviews: list, invoice_to_topic: dict, loop):
         for review in reviews:
             review_id = str(review.get('id', ''))
@@ -1108,9 +1199,7 @@ class BotService:
             old_hash = self.processed_reviews.get(review_id)
             if old_hash == review_hash: continue
             is_updated = old_hash is not None
-            
-            self._save_processed_review_db(review_id, review_hash)
-            
+
             invoice_id = review.get('invoice_id')
             topic_info = invoice_to_topic.get(int(invoice_id)) if invoice_id else None
             topic_id = topic_info.get('topic_id') if topic_info else None
@@ -1123,14 +1212,35 @@ class BotService:
             if review.get('date'): msg += f"📅 {review['date']}\n"
             if info: msg += f"\n💬 {info}"
             
-            await self.send_message_with_cooldown(msg, topic_id)
+            notification_accepted = await self.send_message_with_cooldown(
+                msg,
+                topic_id,
+                dedupe_key=f"review:{review_id}:{review_hash}",
+            )
+            if not notification_accepted:
+                continue
             
             auto_response = self.autoresponder.get_review_response(review_type)
             if auto_response:
                 try:
-                    await loop.run_in_executor(_executor, lambda cid=int(invoice_id), txt=auto_response: self.ggsel_api.send_message(cid, txt))
-                    await self.send_message_with_cooldown(f"📤 {auto_response}", topic_id)
-                except Exception as e: logging.error(f"Review reply error: {e}")
+                    response_sent = await loop.run_in_executor(
+                        _executor,
+                        lambda cid=int(invoice_id), txt=auto_response: self.ggsel_api.send_message(cid, txt),
+                    )
+                    if not response_sent:
+                        continue
+                    echo_accepted = await self.send_message_with_cooldown(
+                        f"📤 {auto_response}",
+                        topic_id,
+                        dedupe_key=f"review-reply:{review_id}:{review_hash}",
+                    )
+                    if not echo_accepted:
+                        continue
+                except Exception as e:
+                    logging.error(f"Review reply error: {e}")
+                    continue
+
+            self._save_processed_review_db(review_id, review_hash)
 
     async def process_pending_history_loads(self):
         if not self.pending_history_loads: return
@@ -1144,7 +1254,7 @@ class BotService:
 
     async def handle_history_command(self, topic_id: int):
         try:
-            target_topic = next((info for info in self.topic_manager.get_all_topics().values() if info.get('topic_id') == topic_id), None)
+            target_topic = self.topic_manager.get_topic_by_topic_id(topic_id)
             if not target_topic: return await self.telegram_bot.send_message("❌ Topic not found in DB", topic_id)
             if not target_topic.get('invoice_id'): return await self.telegram_bot.send_message("❌ No invoice_id", topic_id)
             
@@ -1191,7 +1301,7 @@ class BotService:
     
     async def handle_options_command(self, topic_id: int):
         try:
-            target_topic = next((info for info in self.topic_manager.get_all_topics().values() if info.get('topic_id') == topic_id), None)
+            target_topic = self.topic_manager.get_topic_by_topic_id(topic_id)
             if not target_topic: return await self.telegram_bot.send_message("❌ Topic not found", topic_id)
             if not target_topic.get('invoice_id'): return await self.telegram_bot.send_message("❌ No invoice_id", topic_id)
             
@@ -1202,7 +1312,7 @@ class BotService:
 
     async def handle_review_command(self, topic_id: int):
         try:
-            target_topic = next((info for info in self.topic_manager.get_all_topics().values() if info.get('topic_id') == topic_id), None)
+            target_topic = self.topic_manager.get_topic_by_topic_id(topic_id)
             if not target_topic: return await self.telegram_bot.send_message("❌ Topic not found", topic_id)
             invoice_id = target_topic.get('invoice_id')
             if not invoice_id: return await self.telegram_bot.send_message("❌ No invoice_id", topic_id)

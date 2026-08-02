@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import signal
 import sys
 import os
@@ -30,13 +31,39 @@ async def update_checker(auto_update_enabled: bool):
             logging.error(f"Update check error: {e}")
 
 def setup_logging():
+    """Configure stdout logging and optional rotating file logging.
+
+    Docker should normally capture stdout. Rotating an individually bind-mounted
+    file can fail with ``Device or resource busy`` when the handler renames it.
+    """
+    handlers = [logging.StreamHandler(sys.stdout)]
+
+    if os.getenv('LOG_TO_FILE', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}:
+        log_path = os.getenv(
+            'LOG_FILE_PATH',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ggsel_bot.log')
+        )
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+            handlers.append(
+                RotatingFileHandler(
+                    log_path,
+                    maxBytes=5 * 1024 * 1024,
+                    backupCount=3,
+                    encoding='utf-8',
+                )
+            )
+        except OSError as error:
+            print(
+                f"Warning: file logging is unavailable ({error}); using stdout only.",
+                file=sys.stderr
+            )
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('ggsel_bot.log', encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
+        handlers=handlers,
+        force=True,
     )
     # Silence noisy libraries
     logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -57,8 +84,26 @@ async def main():
             if needs_restart:
                 sys.exit(1)
 
-        if not all([config.ggsel_api_key, config.telegram_bot_token, config.telegram_group_id]):
-            logging.error("Missing required config parameters. Check your .env file.")
+        required_configs = {
+            'GGSEL_SELLER_ID': config.ggsel_seller_id,
+            'GGSEL_API_KEY': config.ggsel_api_key,
+            'TELEGRAM_BOT_TOKEN': config.telegram_bot_token,
+            'TELEGRAM_GROUP_ID': config.telegram_group_id,
+        }
+        missing_configs = [name for name, value in required_configs.items() if not value]
+
+        if missing_configs:
+            configured_env_file = os.getenv(
+                'ENV_FILE',
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+            )
+            logging.error(
+                "Missing required environment variables: %s. Configure the container "
+                "with Docker Compose 'env_file', or mount an env file and set "
+                "ENV_FILE. Current env-file path: %s",
+                ', '.join(missing_configs),
+                configured_env_file,
+            )
             sys.exit(1)
 
         bot_service = BotService(config)
@@ -66,7 +111,6 @@ async def main():
         def signal_handler(signum, frame):
             logging.info("Shutting down safely...")
             bot_service.stop_sync()
-            asyncio.get_event_loop().call_later(5, lambda: sys.exit(0))
         
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)

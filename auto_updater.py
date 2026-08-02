@@ -10,9 +10,12 @@ import asyncio
 import aiohttp
 from typing import Optional, Tuple
 
-# URL для проверки версии и скачивания
-VERSION_URL = "https://raw.githubusercontent.com/voterol/ggsel_seller_helper/main/__init__.py"
-REPO_ZIP_URL = "https://github.com/voterol/ggsel_seller_helper/archive/refs/heads/main.zip"
+# Repository used only when AUTO_UPDATE is explicitly enabled.
+UPDATE_REPOSITORY = os.getenv("UPDATE_REPOSITORY", "paparei/test").strip("/")
+if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", UPDATE_REPOSITORY):
+    raise ValueError("UPDATE_REPOSITORY must use the GitHub owner/repository format")
+VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/main/__init__.py"
+REPO_ZIP_URL = f"https://github.com/{UPDATE_REPOSITORY}/archive/refs/heads/main.zip"
 
 # Текущая директория бота
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))

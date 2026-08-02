@@ -1,0 +1,23 @@
+services:
+  ggsel-bot:
+    image: paparei/ggsel-bot:latest
+    container_name: ggsel-bot
+    restart: unless-stopped
+    pull_policy: always
+
+    # This file stays on the server and is not copied into the Docker image.
+    env_file:
+      - ./.env
+
+    environment:
+      DATABASE_PATH: /app/data/ggsel_bot.db
+      LOG_TO_FILE: "false"
+
+    volumes:
+      - ./data:/app/data
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

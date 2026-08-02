@@ -4,7 +4,7 @@ import logging
 from typing import Optional, Tuple
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters
-from telegram.error import TelegramError, RetryAfter
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from config import Config
 from locales import locales, _ 
 
@@ -28,9 +28,19 @@ class TelegramBot:
     def set_options_handler(self, h): self.options_handler = h
     def set_review_handler(self, h): self.review_handler = h
 
+    @staticmethod
+    def _retry_seconds(value) -> float:
+        if hasattr(value, 'total_seconds'):
+            value = value.total_seconds()
+        try:
+            return max(1, float(value))
+        except (TypeError, ValueError):
+            return 5
+
     async def start(self):
         try:
             self.application = Application.builder().token(self.config.telegram_bot_token).build()
+            self.bot = self.application.bot
             self.application.add_handler(CommandHandler("menu", self._handle_menu_command))
             self.application.add_handler(CommandHandler("history", self._handle_history_command))
             self.application.add_handler(CommandHandler("options", self._handle_options_command))
@@ -63,9 +73,15 @@ class TelegramBot:
             return True, None
         except RetryAfter as e: 
             return False, e.retry_after
-        except Exception as e:
+        except (TimedOut, NetworkError) as e:
+            logging.warning(f"Temporary Telegram send error: {e}")
+            return False, self.config.retry_delay
+        except (BadRequest, Forbidden) as e:
             logging.error(f"Telegram send error: {e}")
-            return False, 60
+            return False, None
+        except Exception as e:
+            logging.error(f"Unexpected Telegram send error: {e}")
+            return False, self.config.retry_delay
     
     async def send_message_with_keyboard(self, text: str, keyboard: list, topic_id: int = None):
         try:
@@ -76,7 +92,7 @@ class TelegramBot:
                 await self.bot.send_message(chat_id=self.group_id, text=text[:4000], reply_markup=reply_markup)
             return True
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+            await asyncio.sleep(self._retry_seconds(e.retry_after))
             return await self.send_message_with_keyboard(text, keyboard, topic_id)
         except Exception as e:
             logging.error(f"Telegram keyboard send error: {e}")
@@ -97,7 +113,7 @@ class TelegramBot:
             if update.callback_query: await update.callback_query.edit_message_text(_("menu_title"), reply_markup=markup)
             else: await update.message.reply_text(_("menu_title"), reply_markup=markup)
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+            await asyncio.sleep(self._retry_seconds(e.retry_after))
             if update.callback_query: await update.callback_query.edit_message_text(_("menu_title"), reply_markup=markup)
             else: await update.message.reply_text(_("menu_title"), reply_markup=markup)
 
@@ -122,7 +138,7 @@ class TelegramBot:
             await self.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
             return True
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+            await asyncio.sleep(self._retry_seconds(e.retry_after))
             return await self.edit_message(message_id, chat_id, text, keyboard)
         except Exception: return False
 
@@ -131,7 +147,13 @@ class TelegramBot:
             result = await self.bot.create_forum_topic(chat_id=self.group_id, name=topic_name[:120])
             return result.message_thread_id, None
         except RetryAfter as e: return None, e.retry_after
-        except Exception: return None, 60
+        except (TimedOut, NetworkError): return None, self.config.retry_delay
+        except (BadRequest, Forbidden) as e:
+            logging.error(f"Telegram topic creation rejected: {e}")
+            return None, None
+        except Exception as e:
+            logging.error(f"Unexpected Telegram topic error: {e}")
+            return None, self.config.retry_delay
 
     async def check_topic_exists(self, topic_id: int, topic_name: str) -> bool:
         try:
@@ -148,9 +170,15 @@ class TelegramBot:
 
     async def stop(self):
         if self.application:
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
+            try:
+                if self.application.updater and self.application.updater.running:
+                    await self.application.updater.stop()
+                if self.application.running:
+                    await self.application.stop()
+                await self.application.shutdown()
+            except RuntimeError:
+                # A partially initialized application may already be stopped.
+                pass
 
     async def _handle_topic_message(self, update: Update, context):
         if update.message and update.message.text and not update.message.from_user.is_bot:

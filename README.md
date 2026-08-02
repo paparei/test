@@ -80,6 +80,26 @@ TELEGRAM_GROUP_ID=-1001234567890
 python main.py
 ```
 
+### Запуск через Docker Compose
+
+```bash
+cp .env.example .env
+cp compose.example.yml compose.yml
+# заполните секреты в .env
+docker compose up -d
+docker compose logs -f ggsel-bot
+```
+
+Файл `.env` намеренно не копируется в Docker-образ. Compose передаёт его
+содержимое контейнеру через `env_file`. Путь в `env_file` вычисляется относительно
+расположения Compose-файла; если Compose-файл хранится в другой папке, укажите
+абсолютный путь к `.env` на сервере.
+
+Не подключайте отдельный файл `ggsel_bot.log` как bind mount: его невозможно
+безопасно переименовать при ротации. В Docker бот по умолчанию пишет в stdout;
+смотрите логи через `docker compose logs`. Для файловых логов включите
+`LOG_TO_FILE=true` и подключите всю папку `/app/data`, а не один log-файл.
+
 ---
 
 ## ⚙️ Команды бота
@@ -182,7 +202,7 @@ ggsel_bot/
 
 **Сообщения не отправляются**
 - Проверьте `GGSEL_API_KEY` и `GGSEL_SELLER_ID`
-- Посмотрите логи в `ggsel_bot.log`
+- При обычном запуске посмотрите `ggsel_bot.log`; в Docker используйте `docker compose logs`
 
 **Как получить GGSel API ключ?**
 - Личный кабинет продавца → Настройки → API

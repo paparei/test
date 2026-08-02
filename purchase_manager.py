@@ -65,7 +65,7 @@ class PurchaseManager:
     
     def add_purchase(self, purchase: Purchase) -> bool:
         try:
-            with __import__('sqlite3').connect(self.db.db_path) as conn:
+            with self.db._connect() as conn:
                 cur = conn.execute("SELECT 1 FROM purchases WHERE invoice_id = ?", (str(purchase.invoice_id),))
                 if cur.fetchone(): return False
                 
@@ -77,6 +77,6 @@ class PurchaseManager:
             return False
     
     def is_purchase_processed(self, invoice_id: int) -> bool:
-        with __import__('sqlite3').connect(self.db.db_path) as conn:
+        with self.db._connect() as conn:
             cur = conn.execute("SELECT 1 FROM purchases WHERE invoice_id = ?", (str(invoice_id),))
             return cur.fetchone() is not None

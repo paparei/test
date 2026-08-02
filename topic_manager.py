@@ -10,7 +10,7 @@ class TopicManager:
     
     def load_topics(self) -> Dict[str, Dict]:
         try:
-            with __import__('sqlite3').connect(self.db.db_path) as conn:
+            with self.db._connect() as conn:
                 # FIXED: Querying 'key', not 'topic_key'
                 cursor = conn.execute("SELECT key, data FROM topics")
                 return {row[0]: json.loads(row[1]) for row in cursor.fetchall()}
@@ -19,32 +19,40 @@ class TopicManager:
             return {}
             
     def _save_single(self, key: str, data: dict):
-        self.topics[key] = data
         try:
-            with __import__('sqlite3').connect(self.db.db_path) as conn:
+            with self.db._connect() as conn:
                 conn.execute("INSERT OR REPLACE INTO topics (key, data) VALUES (?, ?)", (key, json.dumps(data)))
+            self.topics[key] = data
         except Exception as e:
             logging.error(f"Error saving topic to DB: {e}")
 
     def _delete_single(self, key: str) -> bool:
-        if key in self.topics:
-            del self.topics[key]
         try:
-            with __import__('sqlite3').connect(self.db.db_path) as conn:
+            with self.db._connect() as conn:
                 conn.execute("DELETE FROM topics WHERE key = ?", (key,))
+            self.topics.pop(key, None)
             return True
-        except: return False
+        except Exception as e:
+            logging.error(f"Error deleting topic from DB: {e}")
+            return False
 
     def get_all_topics(self) -> Dict[str, Dict]:
-        """Fetch fresh topics from SQLite"""
-        try:
-            with __import__('sqlite3').connect(self.db.db_path) as conn:
-                # FIXED: Querying 'key', not 'topic_key'
-                cursor = conn.execute("SELECT key, data FROM topics")
-                self.topics = {row[0]: json.loads(row[1]) for row in cursor.fetchall()}
-        except Exception as e:
-            logging.error(f"Error getting all topics: {e}")
+        """Return the in-memory view maintained by this manager."""
         return self.topics.copy()
+
+    def refresh_topics(self) -> Dict[str, Dict]:
+        """Reload topics after an external migration or maintenance operation."""
+        self.topics = self.load_topics()
+        return self.get_all_topics()
+
+    def get_topic_by_invoice(self, invoice_id: int) -> Optional[Dict]:
+        return self.topics.get(f"purchase_{invoice_id}")
+
+    def get_topic_by_topic_id(self, topic_id: int) -> Optional[Dict]:
+        return next(
+            (topic for topic in self.topics.values() if topic.get('topic_id') == topic_id),
+            None,
+        )
 
     def add_topic(self, chat_id: int, email: Optional[str], topic_id: int, topic_name: str) -> None:
         key = str(chat_id)

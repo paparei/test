@@ -3,6 +3,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import hashlib
 import time
+import threading
 import json
 import logging
 from typing import Dict, List, Optional, Any
@@ -15,7 +16,7 @@ class TimeoutSession(requests.Session):
         kwargs.setdefault('timeout', 15)
         return super().request(*args, **kwargs)
 
-def create_ggsel_session():
+def create_ggsel_session(max_retries: int = 3):
     """Create a persistent, self-healing session with strict timeouts."""
     session = TimeoutSession()
 
@@ -27,10 +28,11 @@ def create_ggsel_session():
     })
 
     retries = Retry(
-        total=3,
+        total=max(0, max_retries),
         backoff_factor=1,
         status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+        # Retrying message POST requests can deliver duplicate replies.
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
     
     adapter = requests.adapters.HTTPAdapter(max_retries=retries)
@@ -44,7 +46,22 @@ class GGSelAPI:
         self.config = config
         self.base_url = config.ggsel_base_url
         self.token: Optional[str] = None
-        self.session = create_ggsel_session()
+        self._session_local = threading.local()
+        self.session = create_ggsel_session(config.max_retries)
+        self._login_lock = threading.Lock()
+        self._auth_blocked_until = 0.0
+
+    @property
+    def session(self):
+        session = getattr(self._session_local, 'session', None)
+        if session is None:
+            session = create_ggsel_session(self.config.max_retries)
+            self._session_local.session = session
+        return session
+
+    @session.setter
+    def session(self, value):
+        self._session_local.session = value
 
     def _generate_sign(self, timestamp: str) -> str:
         """Генерация подписи"""
@@ -53,12 +70,16 @@ class GGSelAPI:
 
     def login(self) -> bool:
         """Авторизация"""
-        current_time = time.time()
+        # Several background jobs can discover an expired token together. Only
+        # one of them should hit the login endpoint.
+        with self._login_lock:
+            return self._login_locked()
 
-        # --- ANTI-SPAM COOLDOWN ---
-        if hasattr(self, '_last_auth_error_time') and self._last_auth_error_time:
-            if current_time - self._last_auth_error_time < 60:
-                return False
+    def _login_locked(self) -> bool:
+        current_time = time.monotonic()
+
+        if current_time < self._auth_blocked_until:
+            return False
 
         timestamp = str(int(time.time()))
         sign = self._generate_sign(timestamp)
@@ -71,18 +92,18 @@ class GGSelAPI:
                 data = response.json()
                 if isinstance(data, dict) and 'token' in data:
                     self.token = data['token']
-                    self._last_auth_error_time = None
+                    self._auth_blocked_until = 0.0
                     return True
                     
             # Explicit check just in case the retry adapter doesn't catch the 503 first
             elif response.status_code in [502, 503, 504]:
                 logging.error(f"GGSel Server Error ({response.status_code}). WAF block likely. Enforcing 300s cooldown.")
                 self.session.close()
-                self.session = create_ggsel_session()
-                # Offset the timestamp by 240s so the 60s cooldown loop evaluates to 300s (5 mins) total
-                self._last_auth_error_time = current_time + 240 
+                self.session = create_ggsel_session(self.config.max_retries)
+                self._auth_blocked_until = current_time + 300
                 return False
 
+            self._auth_blocked_until = current_time + max(10, self.config.retry_delay)
             return False
 
         except Exception as e:
@@ -91,14 +112,14 @@ class GGSelAPI:
 
             # Destroy corrupted session pool and rebuild
             self.session.close()
-            self.session = create_ggsel_session()
+            self.session = create_ggsel_session(self.config.max_retries)
 
             # If GGSel blocked the connection or timed out, enforce the 5-minute cooldown
             if "Max retries" in str(e) or "Timeout" in str(e) or "503" in str(e):
                 logging.warning("Applying 300-second firewall cooldown to prevent permanent IP ban.")
-                self._last_auth_error_time = current_time + 240
+                self._auth_blocked_until = current_time + 300
             else:
-                self._last_auth_error_time = current_time
+                self._auth_blocked_until = current_time + max(10, self.config.retry_delay)
                 
             return False
 

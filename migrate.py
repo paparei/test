@@ -28,6 +28,14 @@ def migrate():
         conn.execute('CREATE TABLE IF NOT EXISTS purchases (invoice_id TEXT PRIMARY KEY, data TEXT)')
         conn.execute('CREATE TABLE IF NOT EXISTS processed_reviews (review_id TEXT PRIMARY KEY, hash TEXT)')
         conn.execute('CREATE TABLE IF NOT EXISTS pending_topics (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)')
+        conn.execute('''CREATE TABLE IF NOT EXISTS telegram_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT UNIQUE,
+            text TEXT NOT NULL, topic_id INTEGER NOT NULL, chat_id INTEGER,
+            message_id TEXT, parse_mode TEXT, reply_markup TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL,
+            last_error TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_outbox_due ON telegram_outbox(next_attempt_at, id)')
         
         print("✅ New Schema Created.")
 
