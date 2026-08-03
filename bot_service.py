@@ -229,6 +229,11 @@ class BotService:
                 result = await self._send_customer_message(invoice_id, message_text)
                 if result:
                     await self.telegram_bot.add_reaction(message_id, topic_id, "🔥")
+                    await self.send_message_with_cooldown(
+                        f"📤 {message_text}",
+                        topic_id,
+                        dedupe_key=f"telegram-reply:{topic_id}:{message_id}",
+                    )
                 else:
                     await self.send_message_with_cooldown("❌ Send error", topic_id)
             except Exception as e:
