@@ -601,9 +601,10 @@ class BotService:
                 continue
             raw_chat_ids = topic.get('chat_ids') or []
             if not raw_chat_ids and topic.get('invoice_id') in unread_chat_ids:
-                # Legacy topics did not persist debate IDs. An invoice ID is
-                # usable only when GGSel itself returned it as an unread chat.
+                # Legacy topics did not persist debate IDs. Trust and persist an
+                # invoice ID only after GGSel confirms it as an unread chat.
                 raw_chat_ids = [topic.get('invoice_id')]
+                self.topic_manager.update_topic_chat_ids(topic_key, raw_chat_ids)
             for raw_chat_id in raw_chat_ids:
                 try:
                     chat_id = int(raw_chat_id)

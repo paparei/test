@@ -152,9 +152,14 @@ class DurableDeliveryTests(unittest.TestCase):
 
         topic = {"invoice_id": 303, "topic_id": 33, "chat_ids": []}
 
+        persisted = []
+
         class Topics:
             def get_all_topics(self):
                 return {"purchase_303": topic}
+
+            def update_topic_chat_ids(self, topic_key, chat_ids):
+                persisted.append((topic_key, chat_ids))
 
         captured = []
 
@@ -171,6 +176,7 @@ class DurableDeliveryTests(unittest.TestCase):
         asyncio.run(service.check_new_message_chats())
 
         self.assertEqual([{303: topic}], captured)
+        self.assertEqual([("purchase_303", [303])], persisted)
 
     def test_message_polling_sweeps_known_topics_when_unread_list_is_empty(self):
         service = BotService.__new__(BotService)
