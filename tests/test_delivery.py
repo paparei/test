@@ -111,8 +111,8 @@ class DurableDeliveryTests(unittest.TestCase):
                 return {"items": [{"id_i": 101}, {"id_i": 202}]}
 
         topics = {
-            101: {"invoice_id": 101, "topic_id": 11},
-            303: {"invoice_id": 303, "topic_id": 33},
+            101: {"invoice_id": 101, "topic_id": 11, "chat_ids": [101]},
+            303: {"invoice_id": 303, "topic_id": 33, "chat_ids": [303]},
         }
 
         class Topics:
@@ -141,10 +141,7 @@ class DurableDeliveryTests(unittest.TestCase):
 
         self.assertEqual(1, len(api_calls))
         self.assertEqual(1, api_calls[0]["filter_new"])
-        self.assertEqual(
-            {"purchase_101", "purchase_303"},
-            set(captured[0]),
-        )
+        self.assertEqual({101, 303}, set(captured[0]))
 
     def test_message_polling_sweeps_known_topics_when_unread_list_is_empty(self):
         service = BotService.__new__(BotService)
@@ -156,7 +153,7 @@ class DurableDeliveryTests(unittest.TestCase):
         class Topics:
             def get_all_topics(self):
                 return {
-                    "purchase_303": {"invoice_id": 303, "topic_id": 33},
+                    "purchase_303": {"invoice_id": 303, "topic_id": 33, "chat_ids": [909]},
                 }
 
         captured = []
@@ -173,7 +170,7 @@ class DurableDeliveryTests(unittest.TestCase):
 
         asyncio.run(service.check_new_message_chats())
 
-        self.assertEqual([{"purchase_303": {"invoice_id": 303, "topic_id": 33}}], captured)
+        self.assertEqual([{909: {"invoice_id": 303, "topic_id": 33, "chat_ids": [909]}}], captured)
 
     def test_chat_messages_are_processed_in_chronological_order(self):
         service = BotService.__new__(BotService)
