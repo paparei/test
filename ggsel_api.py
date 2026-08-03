@@ -52,7 +52,9 @@ def create_ggsel_session(
     retries = Retry(
         total=retry_count,
         connect=retry_count,
-        read=retry_count,
+        # A read timeout already consumed the full configured timeout. Retrying
+        # it can pin every message-poll worker for minutes and stop all sync.
+        read=0,
         status=retry_count,
         backoff_factor=0.5,
         status_forcelist=(408, 429, 500, 502, 503, 504),

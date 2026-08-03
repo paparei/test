@@ -143,6 +143,35 @@ class DurableDeliveryTests(unittest.TestCase):
         self.assertEqual(1, api_calls[0]["filter_new"])
         self.assertEqual({101, 303}, set(captured[0]))
 
+    def test_message_polling_falls_back_to_invoice_for_legacy_topics(self):
+        service = BotService.__new__(BotService)
+
+        class API:
+            def get_chats(self, **kwargs):
+                return {"items": [{"id_i": 303}]}
+
+        topic = {"invoice_id": 303, "topic_id": 33, "chat_ids": []}
+
+        class Topics:
+            def get_all_topics(self):
+                return {"purchase_303": topic}
+
+        captured = []
+
+        async def capture(selected_topics):
+            captured.append(selected_topics)
+
+        service.ggsel_api = API()
+        service.topic_manager = Topics()
+        service.check_topics_parallel = capture
+        service._chat_sweep_cursor = 0
+        service._chat_sweep_batch_size = 25
+        service._unmapped_unread_chats = set()
+
+        asyncio.run(service.check_new_message_chats())
+
+        self.assertEqual([{303: topic}], captured)
+
     def test_message_polling_sweeps_known_topics_when_unread_list_is_empty(self):
         service = BotService.__new__(BotService)
 

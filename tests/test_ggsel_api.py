@@ -71,6 +71,7 @@ def install_http_stubs():
     class Retry:
         def __init__(self, **kwargs):
             self.allowed_methods = kwargs.get("allowed_methods", frozenset())
+            self.read = kwargs.get("read")
 
     retry_module.Retry = Retry
     urllib3 = types.ModuleType("urllib3")
@@ -150,10 +151,11 @@ class GGSelAPIHardeningTests(unittest.TestCase):
         self.assertEqual((2.0, 9.0), kwargs["timeout"])
         self.assertEqual("ru", kwargs["headers"]["locale"])
 
-    def test_message_posts_are_not_automatically_retried(self):
+    def test_slow_reads_do_not_pin_polling_workers_with_retries(self):
         api = ggsel_api.GGSelAPI(make_config())
         retry = api.session.get_adapter("https://").max_retries
         self.assertNotIn("POST", retry.allowed_methods)
+        self.assertEqual(0, retry.read)
 
     def test_invalid_messages_do_not_cross_the_http_boundary(self):
         api = ggsel_api.GGSelAPI(make_config())
