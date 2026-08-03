@@ -195,5 +195,46 @@ class GGSelAPIHardeningTests(unittest.TestCase):
         )
 
 
+    def test_failed_requests_log_endpoint_and_body(self):
+        api = ggsel_api.GGSelAPI(make_config())
+        api.token = "opaque"
+
+        class FakeResponse:
+            status_code = 400
+
+            def text(self):
+                return '{"error":"bad request"}'
+
+        api.session.request = Mock(return_value=FakeResponse())
+
+        with self.assertLogs(level="WARNING") as cm:
+            self.assertIsNone(api.get_last_sales())
+
+        self.assertTrue(
+            any("GET" in msg and "seller-last-sales" in msg for msg in cm.output),
+            cm.output,
+        )
+
+    def test_failed_message_posts_log_endpoint_and_body(self):
+        api = ggsel_api.GGSelAPI(make_config())
+        api.token = "opaque"
+
+        class FakeResponse:
+            status_code = 400
+
+            def text(self):
+                return '{"error":"invalid chat"}'
+
+        api.session.request = Mock(return_value=FakeResponse())
+
+        with self.assertLogs(level="WARNING") as cm:
+            self.assertFalse(api.send_message(7, "hello"))
+
+        self.assertTrue(
+            any("POST" in msg and "debates/v2" in msg for msg in cm.output),
+            cm.output,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

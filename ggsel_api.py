@@ -181,7 +181,18 @@ class GGSelAPI:
 
         if not 200 <= response.status_code < 300:
             self._set_http_failure(response.status_code)
-            logging.warning("GGSel API returned HTTP %s", response.status_code)
+            body = None
+            try:
+                body = response.text
+            except Exception:
+                pass
+            logging.warning(
+                "GGSel API returned HTTP %s for %s %s: %s",
+                response.status_code,
+                method,
+                path,
+                body,
+            )
             return None
         return response
 
@@ -355,6 +366,16 @@ class GGSelAPI:
                 return False
             if not 200 <= response.status_code < 300:
                 self._set_http_failure(response.status_code)
+                body = None
+                try:
+                    body = response.text
+                except Exception:
+                    pass
+                logging.warning(
+                    "GGSel API returned HTTP %s for POST debates/v2: %s",
+                    response.status_code,
+                    body,
+                )
                 return False
 
             try:
