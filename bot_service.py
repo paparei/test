@@ -5,7 +5,7 @@ import os
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from config import Config
@@ -47,6 +47,15 @@ class BotService:
         self.failed_topics = {}
         self.chat_locks = {}
         self._topic_creation_locks = {}
+        self._chat_sweep_cursor = 0
+        self._unmapped_unread_chats = set()
+        try:
+            configured_sweep_size = int(
+                getattr(config, "chat_sweep_batch_size", 25)
+            )
+        except (TypeError, ValueError):
+            configured_sweep_size = 25
+        self._chat_sweep_batch_size = max(1, min(100, configured_sweep_size))
         self._auth_lock = asyncio.Lock()
         self._review_lock = asyncio.Lock()
         self._sync_transition_lock = asyncio.Lock()
@@ -510,7 +519,10 @@ class BotService:
         await self.process_pending_history_loads()
     
     async def monitor_messages(self):
-        logging.info("Starting message monitor")
+        logging.info(
+            "Starting message monitor (unread chats + %s-chat safety sweep)",
+            self._chat_sweep_batch_size,
+        )
         while self.running:
             try:
                 # Telegram delivery remains live while GGSel synchronization is
@@ -553,9 +565,9 @@ class BotService:
             await asyncio.sleep(max(300, self.config.topic_sync_interval))
 
     async def check_new_message_chats(self):
-        """Fetch only chats that GGsel reports as having unread messages."""
+        """Check unread chats plus a bounded sweep of known purchase chats."""
         loop = asyncio.get_running_loop()
-        changed_chat_ids = set()
+        unread_chat_ids = set()
 
         for page in range(1, 21):
             response = await loop.run_in_executor(
@@ -572,20 +584,67 @@ class BotService:
             items = response.get('items', []) if isinstance(response, dict) else []
             for item in items:
                 chat_id = item.get('id_i')
-                if chat_id is not None:
-                    changed_chat_ids.add(int(chat_id))
+                try:
+                    unread_chat_ids.add(int(chat_id))
+                except (TypeError, ValueError):
+                    continue
 
             if len(items) < 100:
                 break
 
-        if not changed_chat_ids:
+        all_topics = self.topic_manager.get_all_topics()
+        purchase_topics = []
+        topic_by_invoice = {}
+        for topic_key, topic in all_topics.items():
+            if not topic_key.startswith('purchase_') or not isinstance(topic, dict):
+                continue
+            try:
+                invoice_id = int(
+                    topic.get('invoice_id')
+                    or topic_key.replace('purchase_', '', 1)
+                )
+            except (TypeError, ValueError):
+                continue
+            if not topic.get('topic_id'):
+                continue
+            purchase_topics.append((invoice_id, topic))
+            topic_by_invoice[invoice_id] = topic
+
+        if not purchase_topics:
             return
 
-        topics = {}
-        for chat_id in changed_chat_ids:
-            topic = self.topic_manager.get_topic_by_invoice(chat_id)
-            if topic and topic.get('topic_id'):
-                topics[f"purchase_{chat_id}"] = topic
+        # GGSel's unread flag is cleared when an operator opens or replies to a
+        # conversation in the seller dashboard.  Sweep a rotating, bounded
+        # batch as a safety net so those messages are still discovered without
+        # downloading every known conversation on every poll.
+        purchase_topics.sort(key=lambda item: item[0], reverse=True)
+        batch_size = min(
+            len(purchase_topics),
+            max(1, int(getattr(self, '_chat_sweep_batch_size', 25))),
+        )
+        start = int(getattr(self, '_chat_sweep_cursor', 0)) % len(purchase_topics)
+        sweep_chat_ids = {
+            purchase_topics[(start + offset) % len(purchase_topics)][0]
+            for offset in range(batch_size)
+        }
+        self._chat_sweep_cursor = (start + batch_size) % len(purchase_topics)
+
+        unmapped = unread_chat_ids - set(topic_by_invoice)
+        previously_unmapped = getattr(self, '_unmapped_unread_chats', set())
+        newly_unmapped = unmapped - previously_unmapped
+        if newly_unmapped:
+            logging.warning(
+                "Unread GGSel chats have no Telegram topic mapping: %s",
+                ", ".join(str(chat_id) for chat_id in sorted(newly_unmapped)[:10]),
+            )
+        self._unmapped_unread_chats = unmapped
+
+        selected_chat_ids = unread_chat_ids | sweep_chat_ids
+        topics = {
+            f"purchase_{chat_id}": topic_by_invoice[chat_id]
+            for chat_id in selected_chat_ids
+            if chat_id in topic_by_invoice
+        }
 
         if topics:
             await self.check_topics_parallel(topics)
@@ -606,6 +665,35 @@ class BotService:
         async with self.chat_locks[chat_id]:
             try: await self.check_chat_messages(chat_id, topic_id)
             except Exception as e: logging.error(f"Chat check error {chat_id}: {e}")
+
+    @staticmethod
+    def _ggsel_message_sort_key(msg_data: Dict):
+        timestamp_str = msg_data.get(
+            'date_written',
+            msg_data.get(
+                'timestamp',
+                msg_data.get('created_at', msg_data.get('date', msg_data.get('time', ''))),
+            ),
+        )
+        timestamp_value = 0.0
+        if timestamp_str:
+            try:
+                normalized = str(timestamp_str).strip()
+                if normalized.endswith('Z'):
+                    normalized = f"{normalized[:-1]}+00:00"
+                parsed = datetime.fromisoformat(normalized)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamp_value = parsed.timestamp()
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        raw_message_id = msg_data.get('id', '')
+        try:
+            message_id_key = (0, int(raw_message_id))
+        except (TypeError, ValueError):
+            message_id_key = (1, str(raw_message_id))
+        return timestamp_value, message_id_key
     
     async def check_chat_messages(self, chat_id: int, topic_id: int) -> bool:
         try:
@@ -613,7 +701,7 @@ class BotService:
             messages_data = await loop.run_in_executor(_executor, self.ggsel_api.get_chat_messages, chat_id)
             if not messages_data: return False
             has_new = False
-            for msg_data in messages_data:
+            for msg_data in sorted(messages_data, key=self._ggsel_message_sort_key):
                 if await self.process_single_message_check(chat_id, topic_id, msg_data): has_new = True
             return has_new
         except Exception as e:
@@ -626,14 +714,22 @@ class BotService:
             content = msg_data.get('message', msg_data.get('text', msg_data.get('content', '')))
             is_img = msg_data.get('is_img', 0)
             img_url = msg_data.get('url')
-            timestamp_str = msg_data.get('timestamp', msg_data.get('created_at', ''))
+            timestamp_str = msg_data.get(
+                'date_written',
+                msg_data.get('timestamp', msg_data.get('created_at', '')),
+            )
             
             # --- FIX: Don't skip if the message is empty but contains an image! ---
             if not message_id or (not content and not is_img): return False
             if self.message_manager.is_message_processed(chat_id, message_id): return False
             
-            try: timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00').replace('+03:00', '')) if timestamp_str else datetime.now()
-            except: timestamp = datetime.now()
+            try:
+                normalized_timestamp = str(timestamp_str).strip()
+                if normalized_timestamp.endswith('Z'):
+                    normalized_timestamp = f"{normalized_timestamp[:-1]}+00:00"
+                timestamp = datetime.fromisoformat(normalized_timestamp) if normalized_timestamp else datetime.now()
+            except (TypeError, ValueError):
+                timestamp = datetime.now()
             
             # Use a placeholder for the DB if content is empty
             db_content = content if content else "[Image Attachment]"
@@ -752,7 +848,7 @@ class BotService:
         try:
             if chat_id and message_id:
                 dedupe_key = dedupe_key or f"chat-message:{chat_id}:{message_id}"
-                if self.database.is_message_sent(message_id):
+                if self.database.is_message_sent(message_id, chat_id=chat_id):
                     if _outbox_id:
                         self.database.delete_telegram_message(_outbox_id)
                     return True

@@ -42,6 +42,7 @@ class Config:
     # GGSel transport settings. Kept after existing fields for positional compatibility.
     ggsel_connect_timeout: float = 5.0
     ggsel_read_timeout: float = 30.0
+    chat_sweep_batch_size: int = 25
     
     @classmethod
     def from_env(cls) -> 'Config':
@@ -55,6 +56,7 @@ class Config:
             chat_check_interval=int(os.getenv('CHAT_CHECK_INTERVAL', '40')),
             review_check_interval=int(os.getenv('REVIEW_CHECK_INTERVAL', '120')),
             topic_sync_interval=int(os.getenv('TOPIC_SYNC_INTERVAL', '3600')),
+            chat_sweep_batch_size=int(os.getenv('CHAT_SWEEP_BATCH_SIZE', '25')),
             telegram_timeout=int(os.getenv('TELEGRAM_TIMEOUT', '30')),
             max_retries=int(os.getenv('MAX_RETRIES', '3')),
             retry_delay=int(os.getenv('RETRY_DELAY', '5')),

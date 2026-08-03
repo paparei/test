@@ -1,5 +1,6 @@
 import sqlite3
 import time
+import logging
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -52,11 +53,13 @@ class Database:
             ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, message_id TEXT UNIQUE,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, message_id TEXT,
                     content TEXT, timestamp TIMESTAMP, is_sent_to_telegram BOOLEAN DEFAULT FALSE,
-                    FOREIGN KEY (chat_id) REFERENCES chats (id_i)
+                    FOREIGN KEY (chat_id) REFERENCES chats (id_i),
+                    UNIQUE (chat_id, message_id)
                 )
             ''')
+            self._migrate_message_identity(conn)
             
             # Tables required for the JSON-to-SQLite migration and optimized lookups
             conn.execute('CREATE TABLE IF NOT EXISTS topics (key TEXT PRIMARY KEY, data TEXT)')
@@ -90,6 +93,49 @@ class Database:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_delivery ON messages(chat_id, is_sent_to_telegram)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_outbox_due ON telegram_outbox(next_attempt_at, id)')
 
+    @staticmethod
+    def _migrate_message_identity(conn: sqlite3.Connection) -> None:
+        """Replace the legacy global message-id constraint with a chat-scoped one."""
+        unique_columns = set()
+        for index_row in conn.execute("PRAGMA index_list('messages')").fetchall():
+            if not index_row[2]:
+                continue
+            index_name = str(index_row[1]).replace('"', '""')
+            columns = tuple(
+                info_row[2]
+                for info_row in conn.execute(
+                    f'PRAGMA index_info("{index_name}")'
+                ).fetchall()
+            )
+            unique_columns.add(columns)
+
+        if ('message_id',) not in unique_columns:
+            return
+
+        logging.info("Migrating message identity to (chat_id, message_id)")
+        conn.execute('DROP TABLE IF EXISTS messages_v2')
+        conn.execute('''
+            CREATE TABLE messages_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                message_id TEXT,
+                content TEXT,
+                timestamp TIMESTAMP,
+                is_sent_to_telegram BOOLEAN DEFAULT FALSE,
+                FOREIGN KEY (chat_id) REFERENCES chats (id_i),
+                UNIQUE (chat_id, message_id)
+            )
+        ''')
+        conn.execute('''
+            INSERT INTO messages_v2
+                (id, chat_id, message_id, content, timestamp, is_sent_to_telegram)
+            SELECT id, chat_id, message_id, content, timestamp, is_sent_to_telegram
+            FROM messages
+            ORDER BY id
+        ''')
+        conn.execute('DROP TABLE messages')
+        conn.execute('ALTER TABLE messages_v2 RENAME TO messages')
+
     def get_setting(self, key: str) -> Optional[str]:
         with self._connect() as conn:
             row = conn.execute(
@@ -120,11 +166,20 @@ class Database:
             row = cursor.fetchone()
             return Chat(*row) if row else None
 
-    def message_exists(self, message_id: str) -> bool:
-        """Check if a message already exists in the SQLite database"""
+    def message_exists(self, message_id: str, chat_id: Optional[int] = None) -> bool:
+        """Check a chat-scoped message identity, with legacy global lookup support."""
         with self._connect() as conn:
-            cursor = conn.execute('SELECT 1 FROM messages WHERE message_id = ?', (message_id,))
-            return cursor.fetchone() is not None
+            if chat_id is None:
+                row = conn.execute(
+                    'SELECT 1 FROM messages WHERE message_id = ? LIMIT 1',
+                    (message_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    'SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?',
+                    (chat_id, message_id),
+                ).fetchone()
+            return row is not None
 
     def save_message(self, message: Message) -> bool:
         try:
@@ -140,16 +195,31 @@ class Database:
         except sqlite3.IntegrityError:
             return False
 
-    def mark_message_sent(self, message_id: str) -> None:
+    def mark_message_sent(self, message_id: str, chat_id: Optional[int] = None) -> None:
         with self._connect() as conn:
-            conn.execute('UPDATE messages SET is_sent_to_telegram = TRUE WHERE message_id = ?', (message_id,))
+            if chat_id is None:
+                conn.execute(
+                    'UPDATE messages SET is_sent_to_telegram = TRUE WHERE message_id = ?',
+                    (message_id,),
+                )
+            else:
+                conn.execute(
+                    'UPDATE messages SET is_sent_to_telegram = TRUE WHERE chat_id = ? AND message_id = ?',
+                    (chat_id, message_id),
+                )
 
-    def is_message_sent(self, message_id: str) -> bool:
+    def is_message_sent(self, message_id: str, chat_id: Optional[int] = None) -> bool:
         with self._connect() as conn:
-            row = conn.execute(
-                'SELECT is_sent_to_telegram FROM messages WHERE message_id = ?',
-                (message_id,),
-            ).fetchone()
+            if chat_id is None:
+                row = conn.execute(
+                    'SELECT MAX(is_sent_to_telegram) FROM messages WHERE message_id = ?',
+                    (message_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    'SELECT is_sent_to_telegram FROM messages WHERE chat_id = ? AND message_id = ?',
+                    (chat_id, message_id),
+                ).fetchone()
             return bool(row and row[0])
             
     def get_unsent_messages(self, chat_id: int) -> List[Message]:

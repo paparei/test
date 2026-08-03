@@ -101,7 +101,7 @@ class DurableDeliveryTests(unittest.TestCase):
             count = connection.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0]
         self.assertEqual(0, count)
 
-    def test_message_polling_fetches_only_unread_chat_topics(self):
+    def test_message_polling_fetches_unread_and_sweep_chat_topics(self):
         service = BotService.__new__(BotService)
         api_calls = []
 
@@ -112,11 +112,18 @@ class DurableDeliveryTests(unittest.TestCase):
 
         topics = {
             101: {"invoice_id": 101, "topic_id": 11},
+            303: {"invoice_id": 303, "topic_id": 33},
         }
 
         class Topics:
             def get_topic_by_invoice(self, invoice_id):
                 return topics.get(invoice_id)
+
+            def get_all_topics(self):
+                return {
+                    f"purchase_{invoice_id}": topic
+                    for invoice_id, topic in topics.items()
+                }
 
         captured = []
 
@@ -126,12 +133,70 @@ class DurableDeliveryTests(unittest.TestCase):
         service.ggsel_api = API()
         service.topic_manager = Topics()
         service.check_topics_parallel = capture
+        service._chat_sweep_cursor = 0
+        service._chat_sweep_batch_size = 1
+        service._unmapped_unread_chats = set()
 
         asyncio.run(service.check_new_message_chats())
 
         self.assertEqual(1, len(api_calls))
         self.assertEqual(1, api_calls[0]["filter_new"])
-        self.assertEqual(["purchase_101"], list(captured[0]))
+        self.assertEqual(
+            {"purchase_101", "purchase_303"},
+            set(captured[0]),
+        )
+
+    def test_message_polling_sweeps_known_topics_when_unread_list_is_empty(self):
+        service = BotService.__new__(BotService)
+
+        class API:
+            def get_chats(self, **kwargs):
+                return {"items": []}
+
+        class Topics:
+            def get_all_topics(self):
+                return {
+                    "purchase_303": {"invoice_id": 303, "topic_id": 33},
+                }
+
+        captured = []
+
+        async def capture(selected_topics):
+            captured.append(selected_topics)
+
+        service.ggsel_api = API()
+        service.topic_manager = Topics()
+        service.check_topics_parallel = capture
+        service._chat_sweep_cursor = 0
+        service._chat_sweep_batch_size = 25
+        service._unmapped_unread_chats = set()
+
+        asyncio.run(service.check_new_message_chats())
+
+        self.assertEqual([{"purchase_303": {"invoice_id": 303, "topic_id": 33}}], captured)
+
+    def test_chat_messages_are_processed_in_chronological_order(self):
+        service = BotService.__new__(BotService)
+        processed = []
+
+        class API:
+            def get_chat_messages(self, chat_id):
+                return [
+                    {"id": "20", "date_written": "2026-08-03T10:02:00+03:00"},
+                    {"id": "10", "date_written": "2026-08-03T10:01:00+03:00"},
+                ]
+
+        async def capture(chat_id, topic_id, message):
+            processed.append(message["id"])
+            return True
+
+        service.ggsel_api = API()
+        service.process_single_message_check = capture
+
+        result = asyncio.run(service.check_chat_messages(303, 33))
+
+        self.assertTrue(result)
+        self.assertEqual(["10", "20"], processed)
 
     def test_review_is_checkpointed_only_after_delivery_is_accepted(self):
         service = BotService.__new__(BotService)

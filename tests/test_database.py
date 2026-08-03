@@ -52,11 +52,55 @@ class DatabaseOutboxTests(unittest.TestCase):
             timestamp=datetime.now(),
         )
         self.assertTrue(self.database.save_message(message))
-        self.assertFalse(self.database.is_message_sent(message.message_id))
+        self.assertFalse(
+            self.database.is_message_sent(message.message_id, chat_id=message.chat_id)
+        )
 
-        self.database.mark_message_sent(message.message_id)
+        self.database.mark_message_sent(message.message_id, chat_id=message.chat_id)
 
-        self.assertTrue(self.database.is_message_sent(message.message_id))
+        self.assertTrue(
+            self.database.is_message_sent(message.message_id, chat_id=message.chat_id)
+        )
+
+    def test_message_ids_are_unique_within_each_chat(self):
+        first = Message(101, "1", "first", datetime.now())
+        second = Message(202, "1", "second", datetime.now())
+
+        self.assertTrue(self.database.save_message(first))
+        self.assertTrue(self.database.save_message(second))
+        self.database.mark_message_sent("1", chat_id=101)
+
+        self.assertTrue(self.database.is_message_sent("1", chat_id=101))
+        self.assertFalse(self.database.is_message_sent("1", chat_id=202))
+
+    def test_legacy_global_message_constraint_is_migrated(self):
+        legacy_path = str(Path(self.temp_dir.name) / "legacy.db")
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.execute('''
+                CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER,
+                    message_id TEXT UNIQUE,
+                    content TEXT,
+                    timestamp TIMESTAMP,
+                    is_sent_to_telegram BOOLEAN DEFAULT FALSE
+                )
+            ''')
+            connection.execute(
+                "INSERT INTO messages (chat_id, message_id, content, timestamp) VALUES (?, ?, ?, ?)",
+                (101, "1", "legacy", datetime.now().isoformat()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = Database(legacy_path)
+
+        self.assertTrue(migrated.message_exists("1", chat_id=101))
+        self.assertTrue(
+            migrated.save_message(Message(202, "1", "new chat", datetime.now()))
+        )
 
 
 if __name__ == "__main__":
