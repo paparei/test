@@ -579,6 +579,7 @@ class BotService:
                 ),
             )
             if not response:
+                logging.warning("Message poll: GGSel unread chat page %s unavailable", page)
                 break
 
             items = response.get('items', []) if isinstance(response, dict) else []
@@ -608,6 +609,10 @@ class BotService:
                     topic_by_chat_id[chat_id] = topic
 
         if not chat_topics:
+            logging.info(
+                "Message poll complete: unread=%s, mapped=0, swept=0, checked=0",
+                len(unread_chat_ids),
+            )
             return
 
         # GGSel's unread flag is cleared when an operator opens or replies to a
@@ -643,6 +648,13 @@ class BotService:
             if chat_id in topic_by_chat_id
         }
 
+        logging.info(
+            "Message poll complete: unread=%s, mapped=%s, swept=%s, checked=%s",
+            len(unread_chat_ids),
+            len(topic_by_chat_id),
+            len(sweep_chat_ids),
+            len(chats),
+        )
         if chats:
             await self.check_topics_parallel(chats)
     
