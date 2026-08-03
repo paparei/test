@@ -599,7 +599,11 @@ class BotService:
         for topic_key, topic in all_topics.items():
             if not topic_key.startswith('purchase_') or not isinstance(topic, dict) or not topic.get('topic_id'):
                 continue
-            raw_chat_ids = topic.get('chat_ids') or [topic.get('invoice_id')]
+            raw_chat_ids = topic.get('chat_ids') or []
+            if not raw_chat_ids and topic.get('invoice_id') in unread_chat_ids:
+                # Legacy topics did not persist debate IDs. An invoice ID is
+                # usable only when GGSel itself returned it as an unread chat.
+                raw_chat_ids = [topic.get('invoice_id')]
             for raw_chat_id in raw_chat_ids:
                 try:
                     chat_id = int(raw_chat_id)
