@@ -593,43 +593,40 @@ class BotService:
                 break
 
         all_topics = self.topic_manager.get_all_topics()
-        purchase_topics = []
-        topic_by_invoice = {}
+        chat_topics = []
+        topic_by_chat_id = {}
         for topic_key, topic in all_topics.items():
-            if not topic_key.startswith('purchase_') or not isinstance(topic, dict):
+            if not topic_key.startswith('purchase_') or not isinstance(topic, dict) or not topic.get('topic_id'):
                 continue
-            try:
-                invoice_id = int(
-                    topic.get('invoice_id')
-                    or topic_key.replace('purchase_', '', 1)
-                )
-            except (TypeError, ValueError):
-                continue
-            if not topic.get('topic_id'):
-                continue
-            purchase_topics.append((invoice_id, topic))
-            topic_by_invoice[invoice_id] = topic
+            for raw_chat_id in topic.get('chat_ids', []):
+                try:
+                    chat_id = int(raw_chat_id)
+                except (TypeError, ValueError):
+                    continue
+                if chat_id > 0:
+                    chat_topics.append((chat_id, topic))
+                    topic_by_chat_id[chat_id] = topic
 
-        if not purchase_topics:
+        if not chat_topics:
             return
 
         # GGSel's unread flag is cleared when an operator opens or replies to a
         # conversation in the seller dashboard.  Sweep a rotating, bounded
         # batch as a safety net so those messages are still discovered without
         # downloading every known conversation on every poll.
-        purchase_topics.sort(key=lambda item: item[0], reverse=True)
+        chat_topics.sort(key=lambda item: item[0], reverse=True)
         batch_size = min(
-            len(purchase_topics),
+            len(chat_topics),
             max(1, int(getattr(self, '_chat_sweep_batch_size', 25))),
         )
-        start = int(getattr(self, '_chat_sweep_cursor', 0)) % len(purchase_topics)
+        start = int(getattr(self, '_chat_sweep_cursor', 0)) % len(chat_topics)
         sweep_chat_ids = {
-            purchase_topics[(start + offset) % len(purchase_topics)][0]
+            chat_topics[(start + offset) % len(chat_topics)][0]
             for offset in range(batch_size)
         }
-        self._chat_sweep_cursor = (start + batch_size) % len(purchase_topics)
+        self._chat_sweep_cursor = (start + batch_size) % len(chat_topics)
 
-        unmapped = unread_chat_ids - set(topic_by_invoice)
+        unmapped = unread_chat_ids - set(topic_by_chat_id)
         previously_unmapped = getattr(self, '_unmapped_unread_chats', set())
         newly_unmapped = unmapped - previously_unmapped
         if newly_unmapped:
@@ -640,24 +637,24 @@ class BotService:
         self._unmapped_unread_chats = unmapped
 
         selected_chat_ids = unread_chat_ids | sweep_chat_ids
-        topics = {
-            f"purchase_{chat_id}": topic_by_invoice[chat_id]
+        chats = {
+            chat_id: topic_by_chat_id[chat_id]
             for chat_id in selected_chat_ids
-            if chat_id in topic_by_invoice
+            if chat_id in topic_by_chat_id
         }
 
-        if topics:
-            await self.check_topics_parallel(topics)
+        if chats:
+            await self.check_topics_parallel(chats)
     
-    async def check_topics_parallel(self, topics: Dict):
-        if not topics: return
+    async def check_topics_parallel(self, chats: Dict):
+        if not chats: return
         semaphore = asyncio.Semaphore(10)
-        
-        async def check_with_semaphore(invoice_id: int, topic_id: int):
+
+        async def check_with_semaphore(chat_id: int, topic_id: int):
             async with semaphore:
-                await self._check_single_chat(invoice_id, topic_id)
-        
-        tasks = [check_with_semaphore(t.get('invoice_id'), t.get('topic_id')) for t in topics.values() if t.get('topic_id') and t.get('invoice_id')]
+                await self._check_single_chat(chat_id, topic_id)
+
+        tasks = [check_with_semaphore(chat_id, topic.get('topic_id')) for chat_id, topic in chats.items() if topic.get('topic_id')]
         if tasks: await asyncio.gather(*tasks, return_exceptions=True)
     
     async def _check_single_chat(self, chat_id: int, topic_id: int):
