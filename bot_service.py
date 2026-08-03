@@ -3,6 +3,7 @@ import html
 import json
 import os
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -49,7 +50,8 @@ class BotService:
         self._auth_lock = asyncio.Lock()
         self._review_lock = asyncio.Lock()
         self._sync_transition_lock = asyncio.Lock()
-        self._sync_operation_lock = asyncio.Lock()
+        self._sync_state_condition = asyncio.Condition()
+        self._active_sync_operations = 0
         self._customer_write_lock = asyncio.Lock()
         self.sync_enabled = self.database.get_setting("ggsel_sync_enabled") != "false"
         self._sync_enabled_event = asyncio.Event()
@@ -165,12 +167,20 @@ class BotService:
             await self.handle_text_input(chat_id, text)
 
     async def _run_sync_operation(self, operation):
-        """Run one admitted GGSel synchronization operation at a time."""
-        async with self._sync_operation_lock:
+        """Run an admitted GGSel operation without blocking other pollers."""
+        async with self._sync_state_condition:
             if not self.running or not self.sync_enabled:
                 return False
+            self._active_sync_operations += 1
+
+        try:
             await operation()
             return True
+        finally:
+            async with self._sync_state_condition:
+                self._active_sync_operations -= 1
+                if self._active_sync_operations == 0:
+                    self._sync_state_condition.notify_all()
 
     async def _send_customer_message(self, chat_id: int, text: str) -> bool:
         """Serialize customer writes and reject new ones while sync is paused."""
@@ -819,16 +829,19 @@ class BotService:
                 return "▶️ GGSel synchronization is already running."
 
             self.database.set_setting("ggsel_sync_enabled", "true")
-            self.sync_enabled = True
-            self._sync_enabled_event.set()
+            async with self._sync_state_condition:
+                self.sync_enabled = True
+                self._sync_enabled_event.set()
             self.last_auth_time = None
 
             if self.running:
+                # Catch up purchases and unread chats immediately.  Reviews and
+                # the full topic reconciliation wake through their normal loops;
+                # launching all of them here used to let the longest scan delay
+                # message polling after /start_sync.
                 for operation in (
                     self.check_new_purchases,
                     self.check_new_message_chats,
-                    self.check_new_reviews,
-                    self.sync_topics_with_purchases,
                 ):
                     self._tasks.append(
                         asyncio.create_task(self._run_sync_operation(operation))
@@ -845,11 +858,14 @@ class BotService:
             # Close admission first, then wait for admitted synchronization and
             # customer writes to finish before confirming the stopped state.
             self.database.set_setting("ggsel_sync_enabled", "false")
-            self.sync_enabled = False
-            self._sync_enabled_event.clear()
-            async with self._sync_operation_lock:
-                async with self._customer_write_lock:
-                    pass
+            async with self._sync_state_condition:
+                self.sync_enabled = False
+                self._sync_enabled_event.clear()
+                while self._active_sync_operations:
+                    await self._sync_state_condition.wait()
+
+            async with self._customer_write_lock:
+                pass
 
             logging.info("GGSel synchronization stopped by an operator")
             return "⏸ GGSel synchronization stopped. Telegram remains online."
@@ -1187,30 +1203,73 @@ class BotService:
         return False
 
     async def sync_topics_with_purchases(self):
+        started_at = time.monotonic()
+        result = "no changes"
         logging.info("Starting topic sync with purchases...")
-        if not await self.ensure_ggsel_auth(): return
-        
-        loop = asyncio.get_event_loop()
-        sales_data = await loop.run_in_executor(None, self.ggsel_api.get_last_sales, 30)
-        if not sales_data or sales_data.get('retval') != 0: return
-        
-        api_invoice_ids = {sale.get('invoice_id') for sale in sales_data.get('sales', []) if sale.get('invoice_id')}
-        existing_invoice_ids = {int(k.replace('purchase_', '')) for k in self.topic_manager.topics.keys() if k.startswith('purchase_')}
-        
-        missing_invoice_ids = api_invoice_ids - existing_invoice_ids
-        if not missing_invoice_ids: return
-        
-        logging.info(f"Creating {len(missing_invoice_ids)} new topics...")
-        
-        for invoice_id in missing_invoice_ids:
-            purchase_data = await loop.run_in_executor(None, self.ggsel_api.get_purchase_info, invoice_id)
-            if not purchase_data: continue
-            purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
-            if purchase:
-                self.purchase_manager.add_purchase(purchase)
-                await self.create_topic_for_purchase(purchase)
-                if self.flood_control_until: break
-            await asyncio.sleep(1.0)
+        try:
+            if not await self.ensure_ggsel_auth():
+                result = "authentication unavailable"
+                return
+
+            loop = asyncio.get_running_loop()
+            sales_data = await loop.run_in_executor(
+                _executor, self.ggsel_api.get_last_sales, 30
+            )
+            if not sales_data or sales_data.get('retval') != 0:
+                result = "sales API unavailable"
+                return
+
+            api_invoice_ids = set()
+            for sale in sales_data.get('sales', []):
+                try:
+                    api_invoice_ids.add(int(sale.get('invoice_id')))
+                except (TypeError, ValueError):
+                    continue
+
+            existing_invoice_ids = set()
+            for topic_key in self.topic_manager.topics:
+                if not topic_key.startswith('purchase_'):
+                    continue
+                try:
+                    existing_invoice_ids.add(int(topic_key.replace('purchase_', '', 1)))
+                except ValueError:
+                    continue
+
+            missing_invoice_ids = api_invoice_ids - existing_invoice_ids
+            if not missing_invoice_ids:
+                result = f"all {len(api_invoice_ids)} recent purchases already have topics"
+                return
+
+            logging.info("Creating %s missing purchase topics...", len(missing_invoice_ids))
+            created = 0
+            for invoice_id in sorted(missing_invoice_ids):
+                if not self.running or not self.sync_enabled:
+                    result = f"stopped after creating {created} topics"
+                    return
+
+                purchase_data = await loop.run_in_executor(
+                    _executor, self.ggsel_api.get_purchase_info, invoice_id
+                )
+                if not purchase_data:
+                    continue
+                purchase = self.purchase_manager.parse_purchase_response(
+                    purchase_data, invoice_id
+                )
+                if purchase:
+                    self.purchase_manager.add_purchase(purchase)
+                    await self.create_topic_for_purchase(purchase)
+                    created += 1
+                    if self.flood_control_until:
+                        result = f"paused by Telegram flood control after {created} topics"
+                        return
+                await asyncio.sleep(1.0)
+            result = f"created {created} topics"
+        finally:
+            logging.info(
+                "Topic sync finished in %.1fs: %s.",
+                time.monotonic() - started_at,
+                result,
+            )
     
     async def check_deleted_topics(self):
         all_topics = self.topic_manager.get_all_topics()

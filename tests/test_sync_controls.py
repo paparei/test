@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import bot_service as bot_service_module
 from bot_service import BotService
@@ -98,6 +98,71 @@ class SyncControlTests(unittest.TestCase):
             self.assertIn("stopped", await pause_task)
 
         self.loop.run_until_complete(scenario())
+
+    def test_long_sync_does_not_block_message_polling(self):
+        service = self.make_service()
+        service.running = True
+        long_started = asyncio.Event()
+        release_long = asyncio.Event()
+        message_polled = asyncio.Event()
+
+        async def scenario():
+            async def long_topic_sync():
+                long_started.set()
+                await release_long.wait()
+
+            async def message_poll():
+                message_polled.set()
+
+            topic_task = asyncio.create_task(
+                service._run_sync_operation(long_topic_sync)
+            )
+            await long_started.wait()
+            poll_task = asyncio.create_task(service._run_sync_operation(message_poll))
+
+            await asyncio.wait_for(message_polled.wait(), timeout=0.2)
+            self.assertFalse(topic_task.done())
+            release_long.set()
+            await asyncio.gather(topic_task, poll_task)
+
+        self.loop.run_until_complete(scenario())
+
+    def test_pause_waits_for_all_active_sync_operations(self):
+        service = self.make_service()
+        service.running = True
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def scenario():
+            async def active_sync():
+                entered.set()
+                await release.wait()
+
+            sync_task = asyncio.create_task(service._run_sync_operation(active_sync))
+            await entered.wait()
+            pause_task = asyncio.create_task(service.pause_sync())
+            await asyncio.sleep(0)
+
+            self.assertFalse(pause_task.done())
+            release.set()
+            await sync_task
+            self.assertIn("stopped", await pause_task)
+
+        self.loop.run_until_complete(scenario())
+
+    def test_topic_sync_matches_string_invoice_ids_to_existing_topics(self):
+        service = self.make_service()
+        service.running = True
+        service.topic_manager.topics["purchase_42"] = {"invoice_id": 42}
+        service.ensure_ggsel_auth = AsyncMock(return_value=True)
+        service.ggsel_api.get_last_sales.return_value = {
+            "retval": 0,
+            "sales": [{"invoice_id": "42"}],
+        }
+
+        self.loop.run_until_complete(service.sync_topics_with_purchases())
+
+        service.ggsel_api.get_purchase_info.assert_not_called()
 
 
 if __name__ == "__main__":
