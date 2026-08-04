@@ -229,6 +229,10 @@ class BotService:
                 result = await self._send_customer_message(invoice_id, message_text)
                 if result:
                     await self.telegram_bot.add_reaction(message_id, topic_id, "🔥")
+                    # Fetch the server-side message instead of fabricating a
+                    # local echo; GGSel can take a moment to expose the write.
+                    await asyncio.sleep(1)
+                    await self._check_single_chat(int(invoice_id), topic_id)
                 else:
                     await self.send_message_with_cooldown("❌ Send error", topic_id)
             except Exception as e:
@@ -412,7 +416,13 @@ class BotService:
                 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
                 keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_("btn_go_to_order"), url=order_link)]])
                 
-                await self.send_message_with_cooldown(msg, topic_id, parse_mode="HTML", reply_markup=keyboard)
+                await self.send_message_with_cooldown(
+                    msg,
+                    topic_id,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                    dedupe_key=f"new-order:{purchase.invoice_id}",
+                )
                 logging.info(f"Создан топик {topic_id} для {purchase.invoice_id}")
                 
                 if options_list and not skip_greeting:
@@ -599,7 +609,12 @@ class BotService:
         for topic_key, topic in all_topics.items():
             if not topic_key.startswith('purchase_') or not isinstance(topic, dict) or not topic.get('topic_id'):
                 continue
-            raw_chat_ids = topic.get('chat_ids') or [topic.get('invoice_id')]
+            raw_chat_ids = topic.get('chat_ids') or []
+            if not raw_chat_ids and topic.get('invoice_id') in unread_chat_ids:
+                # Legacy topics did not persist debate IDs. Trust and persist an
+                # invoice ID only after GGSel confirms it as an unread chat.
+                raw_chat_ids = [topic.get('invoice_id')]
+                self.topic_manager.update_topic_chat_ids(topic_key, raw_chat_ids)
             for raw_chat_id in raw_chat_ids:
                 try:
                     chat_id = int(raw_chat_id)
@@ -880,9 +895,17 @@ class BotService:
                 self.database.reschedule_telegram_message(outbox_id, remaining, 'Telegram flood control')
                 return True
             self.message_flood_control_until = None
-            
+
+            logging.info(
+                "Telegram delivery attempt pid=%s outbox=%s topic=%s dedupe=%s chat=%s message=%s",
+                os.getpid(), outbox_id, topic_id, dedupe_key, chat_id, message_id,
+            )
             success, cooldown = await self.telegram_bot.send_message(text, topic_id, parse_mode=parse_mode, reply_markup=reply_markup)
-            
+            logging.info(
+                "Telegram delivery result pid=%s outbox=%s topic=%s success=%s retry_after=%s",
+                os.getpid(), outbox_id, topic_id, success, cooldown,
+            )
+
             if success:
                 if chat_id and message_id:
                     self.message_manager.mark_message_sent(chat_id, message_id)
