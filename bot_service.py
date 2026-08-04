@@ -416,7 +416,13 @@ class BotService:
                 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
                 keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_("btn_go_to_order"), url=order_link)]])
                 
-                await self.send_message_with_cooldown(msg, topic_id, parse_mode="HTML", reply_markup=keyboard)
+                await self.send_message_with_cooldown(
+                    msg,
+                    topic_id,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                    dedupe_key=f"new-order:{purchase.invoice_id}",
+                )
                 logging.info(f"Создан топик {topic_id} для {purchase.invoice_id}")
                 
                 if options_list and not skip_greeting:
@@ -889,9 +895,17 @@ class BotService:
                 self.database.reschedule_telegram_message(outbox_id, remaining, 'Telegram flood control')
                 return True
             self.message_flood_control_until = None
-            
+
+            logging.info(
+                "Telegram delivery attempt pid=%s outbox=%s topic=%s dedupe=%s chat=%s message=%s",
+                os.getpid(), outbox_id, topic_id, dedupe_key, chat_id, message_id,
+            )
             success, cooldown = await self.telegram_bot.send_message(text, topic_id, parse_mode=parse_mode, reply_markup=reply_markup)
-            
+            logging.info(
+                "Telegram delivery result pid=%s outbox=%s topic=%s success=%s retry_after=%s",
+                os.getpid(), outbox_id, topic_id, success, cooldown,
+            )
+
             if success:
                 if chat_id and message_id:
                     self.message_manager.mark_message_sent(chat_id, message_id)

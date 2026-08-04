@@ -80,8 +80,10 @@ class TelegramBot:
         except RetryAfter as e: 
             return False, e.retry_after
         except (TimedOut, NetworkError) as e:
-            logging.warning(f"Temporary Telegram send error: {e}")
-            return False, self.config.retry_delay
+            # Telegram may have accepted the request before the connection failed.
+            # Retrying an ambiguous send can duplicate a message in a forum topic.
+            logging.warning("Ambiguous Telegram send result; suppressing duplicate retry: %s", e)
+            return True, None
         except (BadRequest, Forbidden) as e:
             logging.error(f"Telegram send error: {e}")
             return False, None
