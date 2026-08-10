@@ -196,6 +196,17 @@ class GGSelAPIHardeningTests(unittest.TestCase):
             "secret-token", api.session.request.call_args.kwargs["params"]["token"]
         )
 
+    def test_product_lookup_accepts_content_wrapped_product(self):
+        api = ggsel_api.GGSelAPI(make_config())
+        api.token = "secret-token"
+        api.session.request = Mock(
+            return_value=Response(
+                payload={"retval": 0, "content": {"product": {"name": "Wrapped"}}}
+            )
+        )
+
+        self.assertEqual("Wrapped", api.get_real_product_name(99))
+
 
     def test_failed_requests_log_endpoint_and_body(self):
         api = ggsel_api.GGSelAPI(make_config())
