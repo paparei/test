@@ -57,7 +57,7 @@ class DurableDeliveryTests(unittest.TestCase):
         service.database = self.database
         service.message_manager = MessageManager(self.database)
         service.telegram_bot = FakeTelegramBot(responses)
-        service.config = SimpleNamespace(retry_delay=1)
+        service.config = SimpleNamespace(retry_delay=1, telegram_timeout=30)
         service.message_flood_control_until = None
         return service
 
@@ -100,6 +100,37 @@ class DurableDeliveryTests(unittest.TestCase):
         with self.database._connect() as connection:
             count = connection.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0]
         self.assertEqual(0, count)
+
+    def test_direct_send_is_not_redelivered_by_outbox_drain(self):
+        service = self.make_service([])
+        calls = []
+
+        async def exercise():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def send(text, topic_id, parse_mode=None, reply_markup=None):
+                calls.append(text)
+                if len(calls) == 1:
+                    started.set()
+                    await release.wait()
+                return True, None
+
+            service.telegram_bot.send_message = send
+            direct = asyncio.create_task(
+                service.send_message_with_cooldown(
+                    "hello", topic_id=10, dedupe_key="delivery-1"
+                )
+            )
+            await started.wait()
+            try:
+                await service.process_pending_messages()
+                self.assertEqual(["hello"], calls)
+            finally:
+                release.set()
+                await direct
+
+        asyncio.run(exercise())
 
     def test_message_polling_fetches_unread_and_sweep_chat_topics(self):
         service = BotService.__new__(BotService)

@@ -526,6 +526,11 @@ class GGSelAPI:
         )
         data = self._json(response) if response is not None else None
         product = data.get("product") if isinstance(data, dict) else None
+        if not isinstance(product, dict):
+            content = data.get("content") if isinstance(data, dict) else None
+            product = content.get("product") if isinstance(content, dict) else None
+            if not isinstance(product, dict):
+                product = content
         name = product.get("name") if isinstance(product, dict) else None
         if isinstance(name, str) and name.strip():
             self.last_failure = None

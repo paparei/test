@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from uuid import UUID
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from config import Config
 from database import Database, Chat, Message
@@ -356,19 +357,25 @@ class BotService:
                 header = _('noti_restored') if skip_greeting else _('noti_new_purchase')
                 
                 msg = f"{header}\n\n"
-                
-                mapped_name = purchase.name
-                
-                if getattr(purchase, 'item_id', 0) and len(mapped_name) > 30 and '-' in mapped_name:
-                    loop = asyncio.get_event_loop()
-                    real_name = await loop.run_in_executor(None, self.ggsel_api.get_real_product_name, purchase.item_id)
-                    if real_name:
-                        mapped_name = real_name
-                    else:
-                        logging.warning(f"Failed to fetch real name, sticking to UUID: {mapped_name}")
 
-                safe_name = html.escape(str(mapped_name))
-                msg += f"{_('noti_product')} {safe_name}\n"
+                mapped_name = str(purchase.name or '').strip()
+                try:
+                    UUID(mapped_name)
+                except ValueError:
+                    pass
+                else:
+                    loop = asyncio.get_event_loop()
+                    mapped_name = await loop.run_in_executor(
+                        None, self.ggsel_api.get_real_product_name, purchase.item_id
+                    ) if getattr(purchase, 'item_id', 0) else ''
+                    if not mapped_name:
+                        logging.warning(
+                            "Failed to resolve product name for item %s; omitting UUID placeholder",
+                            purchase.item_id,
+                        )
+
+                if mapped_name:
+                    msg += f"{_('noti_product')} {html.escape(mapped_name)}\n"
                 if getattr(purchase, 'item_id', 0): msg += f"{_('noti_item_id')} {purchase.item_id}\n"
                 msg += f"{_('noti_invoice')} <a href='{order_link}'>{purchase.invoice_id}</a>\n"
                 if date_str: msg += f"{_('noti_date')} {date_str}\n"
@@ -880,6 +887,10 @@ class BotService:
 
             outbox_id = _outbox_id
             if outbox_id is None:
+                # ponytail: this lease covers one bot replica; use an atomic DB claim before scaling out.
+                delivery_lease = self._cooldown_seconds(
+                    getattr(self.config, 'telegram_timeout', 30), 30
+                ) + 5
                 outbox_id = self.database.enqueue_telegram_message(
                     text=text,
                     topic_id=topic_id,
@@ -888,6 +899,7 @@ class BotService:
                     parse_mode=parse_mode,
                     reply_markup=self._serialize_reply_markup(reply_markup),
                     dedupe_key=dedupe_key,
+                    delay_seconds=delivery_lease,
                 )
 
             if self.message_flood_control_until and datetime.now() < self.message_flood_control_until:
