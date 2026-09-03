@@ -3,6 +3,7 @@ import html
 import json
 import os
 import logging
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -18,24 +19,35 @@ from message_manager import MessageManager
 from purchase_manager import PurchaseManager, Purchase
 from locales import locales, _
 from autoresponder import AutoResponder
+from repricing import (
+    calculate_repricing_rub,
+    current_rub_price,
+    parse_repricing_settings,
+    parse_repricing_target,
+    repricing_settings_json,
+)
+from competitive_analysis import CompetitiveAnalyzer
 
 _executor = ThreadPoolExecutor(max_workers=10)
+
 
 class BotService:
     def __init__(self, config: Config):
         self.config = config
         self.database = Database(config.database_path)
+        self._load_repricing_settings()
         self.ggsel_api = GGSelAPI(config)
+        self.competitive_analyzer = CompetitiveAnalyzer(self.ggsel_api, config)
         self.telegram_bot = TelegramBot(config)
         self.last_available_balance = 0.0
         self.usd_rub_rate = 79.14 # Default fallback rate
-        
+
         # Managers now strictly use the SQLite Database - Zero JSON blocking!
         self.topic_manager = TopicManager(self.database)
         self.message_manager = MessageManager(self.database)
         self.purchase_manager = PurchaseManager(self.database)
         self.autoresponder = AutoResponder()
-        
+
         self.running = False
         self.last_auth_time = None
         self.auth_interval = 15 * 60
@@ -69,19 +81,75 @@ class BotService:
             self._sync_enabled_event.set()
         self._tasks = []
         self._stopping = False
-        
+
         self._load_pending_topics()
         self._load_processed_reviews()
-        
+
     def get_main_menu_markup(self):
         keyboard = [
             [InlineKeyboardButton(_("btn_auto"), callback_data="auto_menu")],
             [InlineKeyboardButton(_("btn_balance"), callback_data="check_balance")],
+            [InlineKeyboardButton("💱 Price control", callback_data="repricing_menu")],
+            [InlineKeyboardButton("📊 Competitive analysis", callback_data="analysis_menu")],
             [InlineKeyboardButton(_("btn_stats"), callback_data="stats")],
             [InlineKeyboardButton(_("btn_lang"), callback_data="lang_toggle")],
             [InlineKeyboardButton(_("btn_close"), callback_data="close")]
         ]
         return InlineKeyboardMarkup(keyboard)
+
+    def _load_repricing_settings(self) -> None:
+        value = self.database.get_setting("repricing_dry_run")
+        if value is not None:
+            try:
+                enabled, targets = parse_repricing_settings(value)
+            except ValueError as exc:
+                logging.warning("Ignoring invalid saved repricing settings: %s", exc)
+            else:
+                self.config.repricing_dry_run = enabled
+                self.config.repricing_targets_usd = targets
+
+        saved_live = self.database.get_setting("repricing_live_enabled")
+        if saved_live is not None:
+            self.config.repricing_live_enabled = saved_live == "true"
+        if getattr(self.config, "repricing_live_enabled", False) and (
+            getattr(self.config, "ggsel_v2_price_write_enabled", False) is not True
+            or not getattr(self.config, "repricing_targets_usd", {})
+        ):
+            logging.error("Ignoring unsafe saved live repricing mode")
+            self.config.repricing_live_enabled = False
+        if getattr(self.config, "repricing_live_enabled", False):
+            self.config.repricing_dry_run = False
+
+    def _store_repricing_settings(self, enabled: bool, targets: Dict[int, float]) -> None:
+        self.database.set_setting(
+            "repricing_dry_run", repricing_settings_json(enabled, targets)
+        )
+        self.database.set_setting("repricing_live_enabled", "false")
+        self.config.repricing_live_enabled = False
+        self.config.repricing_dry_run = enabled
+        self.config.repricing_targets_usd = dict(targets)
+
+    def _store_repricing_live_settings(
+        self, enabled: bool, targets: Dict[int, float]
+    ) -> None:
+        if enabled and (
+            getattr(self.config, "ggsel_v2_price_write_enabled", False) is not True
+            or not str(getattr(self.config, "ggsel_v2_api_key", "")).strip()
+            or not targets
+        ):
+            raise ValueError(
+                "live mode requires the server write gate, V2 key, and a target"
+            )
+        self.database.set_setting(
+            "repricing_dry_run", repricing_settings_json(False, targets)
+        )
+        self.database.set_setting(
+            "repricing_live_enabled", "true" if enabled else "false"
+        )
+        # ponytail: one trusted Telegram group approves all targets; add per-admin ACLs for multi-user groups.
+        self.config.repricing_dry_run = False
+        self.config.repricing_live_enabled = enabled
+        self.config.repricing_targets_usd = dict(targets)
 
     # --- SQLite Replaced JSON Stores ---
     def _load_processed_reviews(self):
@@ -136,7 +204,7 @@ class BotService:
     async def start(self):
         """Fast Boot - Single User Mode"""
         logging.info("Starting GGSel bot...")
-        
+
         self.telegram_bot.set_topic_message_handler(self.handle_topic_message)
         self.telegram_bot.set_callback_handler(self.handle_callback)
         self.telegram_bot.set_general_message_handler(self.handle_general_message)
@@ -145,7 +213,7 @@ class BotService:
         self.telegram_bot.set_review_handler(self.handle_review_command)
         self.telegram_bot.set_start_sync_handler(self.start_sync)
         self.telegram_bot.set_stop_sync_handler(self.pause_sync)
-        
+
         if not await self.telegram_bot.start():
             raise RuntimeError("Telegram bot failed to initialize")
         self.running = True
@@ -157,10 +225,10 @@ class BotService:
             asyncio.create_task(self.topic_sync_loop()),
             asyncio.create_task(self.reauth_scheduler()),
             asyncio.create_task(self.purchase_checker()),
-            asyncio.create_task(self.balance_monitor_loop()), 
+            asyncio.create_task(self.balance_monitor_loop()),
             asyncio.create_task(self.update_exchange_rate_loop())
         ]
-        
+
         try:
             await asyncio.gather(*self._tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -170,7 +238,7 @@ class BotService:
 
     def handle_topic_message(self, topic_id: int, message_text: str, username: str, message_id: int):
         asyncio.create_task(self._handle_topic_message_async(topic_id, message_text, username, message_id))
-    
+
     async def handle_general_message(self, text: str):
         chat_id = self.config.telegram_group_id
         if chat_id in self.awaiting_input:
@@ -206,7 +274,7 @@ class BotService:
                     text,
                 )
             )
-    
+
     async def _handle_topic_message_async(self, topic_id: int, message_text: str, username: str, message_id: int):
         try:
             if message_text.startswith('/'): return
@@ -216,16 +284,16 @@ class BotService:
                     topic_id,
                 )
                 return
-            
+
             target_topic = self.topic_manager.get_topic_by_topic_id(topic_id)
-            
+
             if not target_topic: return
-            
+
             invoice_id = target_topic.get('invoice_id')
             if not invoice_id:
                 await self.send_message_with_cooldown("⚠️ No invoice_id", topic_id)
                 return
-            
+
             try:
                 result = await self._send_customer_message(invoice_id, message_text)
                 if result:
@@ -239,10 +307,10 @@ class BotService:
             except Exception as e:
                 logging.error(f"Error sending to chat {invoice_id}: {e}")
                 await self.send_message_with_cooldown("❌ Send error", topic_id)
-            
+
         except Exception as e:
             logging.error(f"Error processing message: {e}")
-    
+
     async def ensure_ggsel_auth(self) -> bool:
         current_time = datetime.now()
         if self.last_auth_time and current_time - self.last_auth_time < timedelta(seconds=self.auth_interval):
@@ -258,7 +326,7 @@ class BotService:
                 self.last_auth_time = current_time
                 return True
             return False
-    
+
     async def purchase_checker(self):
         while self.running:
             await self._sync_enabled_event.wait()
@@ -267,7 +335,7 @@ class BotService:
             try: await self._run_sync_operation(self.check_new_purchases)
             except Exception as e: logging.error(f"Purchase check error: {e}")
             await asyncio.sleep(max(10, self.config.chat_check_interval))
-    
+
     async def check_new_purchases(self):
         if not await self.ensure_ggsel_auth(): return
         loop = asyncio.get_event_loop()
@@ -275,35 +343,35 @@ class BotService:
         except Exception as e:
             logging.debug(f"Sales fetch error: {e}")
             return
-        
+
         if not sales_data or sales_data.get('retval') != 0: return
-        
+
         for sale in sales_data.get('sales', []):
             invoice_id = sale.get('invoice_id')
             if not invoice_id: continue
-            
+
             if invoice_id in self.failed_topics:
                 if datetime.now() - self.failed_topics[invoice_id] < timedelta(minutes=10): continue
                 del self.failed_topics[invoice_id]
-            
+
             if not self.purchase_manager.is_purchase_processed(invoice_id):
                 await self.process_new_purchase(invoice_id)
-    
+
     async def process_new_purchase(self, invoice_id: int):
         try:
             if self.failed_topics.get(invoice_id) and datetime.now() - self.failed_topics[invoice_id] < timedelta(minutes=5): return
             if not await self.ensure_ggsel_auth():
                 self.failed_topics[invoice_id] = datetime.now()
                 return
-            
+
             loop = asyncio.get_event_loop()
             purchase_data = await loop.run_in_executor(None, self.ggsel_api.get_purchase_info, invoice_id)
-            
+
             if not purchase_data:
                 self.failed_topics[invoice_id] = datetime.now()
                 logging.warning(f"Failed to get info for purchase {invoice_id}; it will be retried")
                 return
-            
+
             purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
             if purchase and self.purchase_manager.add_purchase(purchase):
                 logging.info(f"Purchase: {purchase.invoice_id} - {purchase.buyer_email}")
@@ -311,7 +379,7 @@ class BotService:
         except Exception as e:
             self.failed_topics[invoice_id] = datetime.now()
             logging.error(f"Error processing purchase {invoice_id}: {e}")
-    
+
     async def create_topic_for_purchase(self, purchase: Purchase, skip_greeting: bool = False):
         lock = self._topic_creation_locks.setdefault(purchase.invoice_id, asyncio.Lock())
         async with lock:
@@ -323,27 +391,27 @@ class BotService:
             failed_time = self.failed_topics.get(purchase.invoice_id)
             if failed_time and datetime.now() - failed_time < timedelta(minutes=5):
                 return
-            
+
             if self.flood_control_until and datetime.now() < self.flood_control_until:
                 logging.info(f"Flood control, добавляем в очередь: {purchase.invoice_id}")
                 self.pending_topics.append({'purchase': purchase, 'timestamp': datetime.now(), 'skip_greeting': skip_greeting})
                 self._save_pending_topics()
                 return
             self.flood_control_until = None
-            
+
             topic_key = f"purchase_{purchase.invoice_id}"
             if self.topic_manager.get_all_topics().get(topic_key):
                 return
-            
+
             customer_id = purchase.buyer_email or purchase.buyer_account or f"Customer_{purchase.invoice_id}"
             topic_name = f"💬 {purchase.invoice_id} | {customer_id}"
-            
+
             await asyncio.sleep(2)
             topic_id, cooldown = await self.telegram_bot.create_topic(topic_name)
-            
+
             if topic_id is not None:
                 self.topic_manager.add_topic_for_purchase(purchase, topic_id, topic_name)
-                
+
                 date_str = ""
                 if purchase.purchase_date:
                     try:
@@ -351,11 +419,11 @@ class BotService:
                         date_str = dt.strftime('%d.%m.%Y %H:%M')
                     except:
                         date_str = purchase.purchase_date
-                
+
                 # --- EXACT LAYOUT REPLICATION (NO DOUBLE EMOJIS) ---
                 order_link = f"https://seller.ggsel.com/orders/{purchase.invoice_id}"
                 header = _('noti_restored') if skip_greeting else _('noti_new_purchase')
-                
+
                 msg = f"{header}\n\n"
 
                 mapped_name = str(purchase.name or '').strip()
@@ -379,20 +447,20 @@ class BotService:
                 if getattr(purchase, 'item_id', 0): msg += f"{_('noti_item_id')} {purchase.item_id}\n"
                 msg += f"{_('noti_invoice')} <a href='{order_link}'>{purchase.invoice_id}</a>\n"
                 if date_str: msg += f"{_('noti_date')} {date_str}\n"
-                
+
                 # Prices Block
                 msg += f"\n💰 <b>{_('noti_prices')}</b>\n"
                 amt_rub = purchase.amount_rub if getattr(purchase, 'amount_rub', 0) > 0 else purchase.amount
                 amt_usd = purchase.amount_usd if getattr(purchase, 'amount_usd', 0) > 0 else round(purchase.amount / 90.0, 2)
                 msg += f"• RUB: {amt_rub}\n"
                 msg += f"• USD: {amt_usd}\n"
-                
+
                 # Details Block
                 state = purchase.invoice_state
                 # Force "In progress" status default since auto-complete is off
                 status_text = _('noti_status_processing') if state in (0, 1) else _('noti_status_done')
                 profit = purchase.profit if getattr(purchase, 'profit', 0) > 0 else purchase.amount
-                
+
                 # --- NEW: Calculate the estimated USD profit dynamically ---
                 if purchase.currency_type == 'RUB':
                     profit_usd = round(profit / self.usd_rub_rate, 2)
@@ -401,28 +469,28 @@ class BotService:
                     profit_str = f"{profit} USD"
                 else:
                     profit_str = f"{profit} {purchase.currency_type}"
-                
+
                 msg += f"\n📊 <b>{_('noti_details')}</b>\n"
                 msg += f"{_('noti_total')} {purchase.amount} {purchase.currency_type}\n"
                 msg += f"{_('noti_status')} {status_text}\n"
                 msg += f"{_('noti_profit')} {profit_str}\n"
-                
+
                 # Buyer Info Block
                 msg += f"\n👤 <b>{_('noti_buyer_info')}</b>\n"
                 if purchase.payment_method: msg += f"{_('noti_payment')} {html.escape(str(purchase.payment_method))}\n"
                 if purchase.buyer_account: msg += f"{_('noti_account')} {html.escape(str(purchase.buyer_account))}\n"
                 if purchase.buyer_email: msg += f"{_('noti_email')} {html.escape(str(purchase.buyer_email))}\n"
                 if getattr(purchase, 'payment_aggregator', ''): msg += f"{_('noti_aggregator')} {html.escape(str(purchase.payment_aggregator))}\n"
-                
+
                 # Options Block
                 options_text, options_list = await self.get_purchase_options_with_list(purchase.invoice_id)
-                if options_text: 
+                if options_text:
                     safe_options = html.escape(options_text)
                     msg += f"\n⚙️ <b>{_('noti_options')}</b>\n{safe_options}\n"
-                
+
                 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
                 keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_("btn_go_to_order"), url=order_link)]])
-                
+
                 await self.send_message_with_cooldown(
                     msg,
                     topic_id,
@@ -431,10 +499,10 @@ class BotService:
                     dedupe_key=f"new-order:{purchase.invoice_id}",
                 )
                 logging.info(f"Создан топик {topic_id} для {purchase.invoice_id}")
-                
+
                 if options_list and not skip_greeting:
                     await self.process_csv_rules(purchase.invoice_id, topic_id, options_list)
-                
+
                 if not skip_greeting and self.autoresponder.should_send_first_message():
                     greeting = self.autoresponder.get_first_message_text()
                     if greeting:
@@ -443,7 +511,7 @@ class BotService:
                                 await self.send_message_with_cooldown(f"📤 {greeting}", topic_id)
                         except Exception as e:
                             logging.error(f"Ошибка отправки приветствия: {e}")
-                    
+
             elif cooldown:
                 retry_seconds = self._cooldown_seconds(cooldown, self.config.retry_delay) + 5
                 self.flood_control_until = datetime.now() + timedelta(seconds=retry_seconds)
@@ -451,11 +519,11 @@ class BotService:
                 self._save_pending_topics()
             else:
                 self.failed_topics[purchase.invoice_id] = datetime.now()
-                
+
         except Exception as e:
             self.failed_topics[purchase.invoice_id] = datetime.now()
             logging.error(f"Ошибка создания топика покупки {purchase.invoice_id}: {e}")
-    
+
     async def load_chat_history(self, chat_ids: List[int], topic_id: int, force_reload: bool = False):
         try:
             all_messages = []
@@ -466,7 +534,7 @@ class BotService:
                     for msg in messages_data:
                         msg['_chat_id'] = chat_id
                         all_messages.append(msg)
-            
+
             if not all_messages and self.autoresponder.should_send_first_message():
                 greeting = self.autoresponder.get_first_message_text()
                 if greeting and chat_ids:
@@ -474,55 +542,55 @@ class BotService:
                         if await self._send_customer_message(chat_id, greeting):
                             await self.send_message_with_cooldown(greeting, topic_id)
                 return
-            
+
             if not all_messages: return
-            
+
             def get_timestamp(msg):
                 ts = msg.get('timestamp', msg.get('created_at', msg.get('date', msg.get('time', ''))))
                 if not ts: return datetime.min
                 try: return datetime.fromisoformat(str(ts).replace('Z', '+00:00').replace('+03:00', ''))
                 except: return datetime.min
-            
+
             all_messages.sort(key=get_timestamp)
             logging.info(f"Loaded {len(all_messages)} messages for topic {topic_id}")
-            
+
             for msg in all_messages:
                 message_id = str(msg.get('id', ''))
                 content = msg.get('message', msg.get('text', msg.get('content', '')))
                 chat_id = msg.get('_chat_id')
                 timestamp = get_timestamp(msg)
-                
+
                 if not content: continue
                 if not force_reload and self.message_manager.is_message_processed(chat_id, message_id): continue
-                
+
                 message_text = f"📜 {content}" if force_reload else content
                 await self.send_message_with_cooldown(message_text, topic_id, chat_id, message_id)
-                
+
                 if not force_reload:
                     await self.message_manager.add_processed_message(chat_id, message_id, content, timestamp)
                 await asyncio.sleep(0.5)
-                
+
         except Exception as e: logging.error(f"History load error: {e}")
-    
+
     async def process_pending_topics(self):
         if not self.pending_topics:
             await self.process_pending_history_loads()
             return
-        
+
         if self.flood_control_until and datetime.now() < self.flood_control_until: return
         self.flood_control_until = None
-        
+
         topics = self.pending_topics.copy()
         self.pending_topics.clear()
         self._save_pending_topics()
-        
+
         logging.info(f"Processing {len(topics)} pending topics")
-        
+
         for i, data in enumerate(topics):
             if data.get('timestamp') and (datetime.now() - data.get('timestamp')).total_seconds() < 30:
                 self.pending_topics.append(data)
                 continue
-            
+
             await self.create_topic_for_purchase(data['purchase'], skip_greeting=data.get('skip_greeting', False))
             if self.flood_control_until:
                 remaining_topics = topics[i+1:]
@@ -534,7 +602,7 @@ class BotService:
             await asyncio.sleep(3)
         self._save_pending_topics()
         await self.process_pending_history_loads()
-    
+
     async def monitor_messages(self):
         logging.info(
             "Starting message monitor (unread chats + %s-chat safety sweep)",
@@ -680,7 +748,7 @@ class BotService:
         )
         if chats:
             await self.check_topics_parallel(chats)
-    
+
     async def check_topics_parallel(self, chats: Dict):
         if not chats: return
         semaphore = asyncio.Semaphore(10)
@@ -691,7 +759,7 @@ class BotService:
 
         tasks = [check_with_semaphore(chat_id, topic.get('topic_id')) for chat_id, topic in chats.items() if topic.get('topic_id')]
         if tasks: await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     async def _check_single_chat(self, chat_id: int, topic_id: int):
         if chat_id not in self.chat_locks: self.chat_locks[chat_id] = asyncio.Lock()
         async with self.chat_locks[chat_id]:
@@ -726,7 +794,7 @@ class BotService:
         except (TypeError, ValueError):
             message_id_key = (1, str(raw_message_id))
         return timestamp_value, message_id_key
-    
+
     async def check_chat_messages(self, chat_id: int, topic_id: int) -> bool:
         try:
             loop = asyncio.get_event_loop()
@@ -739,7 +807,7 @@ class BotService:
         except Exception as e:
             logging.error(f"Chat check error {chat_id}: {e}")
             return False
-    
+
     async def process_single_message_check(self, chat_id: int, topic_id: int, msg_data: Dict) -> bool:
         try:
             message_id = str(msg_data.get('id', ''))
@@ -750,11 +818,11 @@ class BotService:
                 'date_written',
                 msg_data.get('timestamp', msg_data.get('created_at', '')),
             )
-            
+
             # --- FIX: Don't skip if the message is empty but contains an image! ---
             if not message_id or (not content and not is_img): return False
             if self.message_manager.is_message_processed(chat_id, message_id): return False
-            
+
             try:
                 normalized_timestamp = str(timestamp_str).strip()
                 if normalized_timestamp.endswith('Z'):
@@ -762,22 +830,22 @@ class BotService:
                 timestamp = datetime.fromisoformat(normalized_timestamp) if normalized_timestamp else datetime.now()
             except (TypeError, ValueError):
                 timestamp = datetime.now()
-            
+
             # Use a placeholder for the DB if content is empty
             db_content = content if content else "[Image Attachment]"
-            
+
             if await self.message_manager.add_processed_message(chat_id, message_id, db_content, timestamp):
                 logging.info(f"New message in chat {chat_id}: {db_content[:50]}...")
-                
+
                 # --- NEW: Image forwarding logic ---
                 try:
                     if is_img == 1 and img_url:
                         # If the user sent text WITH the photo, put it in the Telegram caption
                         caption_text = f"👤 <b>Customer:</b> {html.escape(str(content))}" if content else ""
                         await self.telegram_bot.application.bot.send_photo(
-                            chat_id=self.config.telegram_group_id, 
-                            message_thread_id=topic_id, 
-                            photo=img_url, 
+                            chat_id=self.config.telegram_group_id,
+                            message_thread_id=topic_id,
+                            photo=img_url,
                             caption=caption_text,
                             parse_mode="HTML"
                         )
@@ -792,7 +860,7 @@ class BotService:
                     safe_content = html.escape(str(content)) if content else ''
                     fallback_text = f"🖼 <a href='{safe_url}'>Customer sent an image</a>\n{safe_content}" if is_img else safe_content
                     await self.send_message_with_cooldown(fallback_text, topic_id, chat_id, message_id, parse_mode="HTML")
-                
+
                 # Auto-responder logic (only trigger if there is actual text)
                 if content:
                     try:
@@ -804,7 +872,7 @@ class BotService:
                             if response_text:
                                 if await self._send_customer_message(chat_id, response_text):
                                     await self.send_message_with_cooldown(response_text, topic_id)
-                            
+
                             if notify_group:
                                 topic_info = self.topic_manager.get_topic_by_topic_id(topic_id)
                                 notify_msg = auto_result.get("notify_text", "") or "🔔 Reply required!"
@@ -816,7 +884,7 @@ class BotService:
         except Exception as e:
             logging.error(f"Message process error: {e}")
             return False
-    
+
     async def stop(self):
         if self._stopping:
             return
@@ -864,7 +932,7 @@ class BotService:
         except Exception as e:
             logging.warning(f"Could not restore Telegram keyboard: {e}")
             return None
-    
+
     async def send_message_with_cooldown(
         self,
         text: str,
@@ -934,7 +1002,7 @@ class BotService:
             # exact same payload forever.
             self.database.delete_telegram_message(outbox_id)
             return False
-                
+
         except Exception as e:
             logging.error(f"Send error: {e}")
             return False
@@ -957,7 +1025,7 @@ class BotService:
             if self.message_flood_control_until:
                 break
             await asyncio.sleep(0.2)
-    
+
     async def reauth_scheduler(self):
         while self.running:
             await asyncio.sleep(self.auth_interval)
@@ -1010,7 +1078,7 @@ class BotService:
 
             logging.info("GGSel synchronization stopped by an operator")
             return "⏸ GGSel synchronization stopped. Telegram remains online."
-    
+
     def stop_sync(self):
         self.running = False
         self._sync_enabled_event.set()
@@ -1021,22 +1089,22 @@ class BotService:
     def _safe_parse_idx(self, data: str, prefix: str) -> int:
         try: return int(data.replace(prefix, ""))
         except (ValueError, TypeError): return -1
-    
+
     async def handle_callback(self, data: str, update, context):
         query = update.callback_query
         if data == "auto_menu_new":
             await self.send_auto_menu_new(update.effective_chat.id)
             return
-        
+
         chat_id = query.message.chat.id
         message_id = query.message.message_id
-        
+
         if data == "auto_menu": await self.show_auto_menu(chat_id, message_id)
         elif data == "check_balance":
             try:
                 # Answer immediately so the Telegram button loading spinner stops
                 await query.answer()
-                
+
                 if not await self.ensure_ggsel_auth():
                     await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, "❌ Auth Error", None)
                     return
@@ -1051,9 +1119,9 @@ class BotService:
                     avail = float(content.get("amount_t_free") or 0.0)
                     hold = float(content.get("amount_t_lock") or 0.0)
                     total = avail + hold
-                    
+
                     self.last_available_balance = avail
-                    
+
                     balance_text = _("balance_header") + _("balance_body").format(
                         total=f"{total:.2f}", avail=f"{avail:.2f}", hold=f"{hold:.2f}", curr="USD"
                     )
@@ -1068,6 +1136,103 @@ class BotService:
                 keyboard = [[InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")]]
                 await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, "⚠️ Error connecting to GGSel. They might be temporarily down.", keyboard)
         elif data == "main_menu": await self.telegram_bot._handle_menu_command(update, context)
+        elif data == "repricing_menu":
+            self.awaiting_input.pop(chat_id, None)
+            await self.show_repricing_menu(chat_id, message_id)
+        elif data.startswith("repricing_browse_"):
+            await self.show_repricing_offer_picker(
+                chat_id, message_id, self._safe_parse_idx(data, "repricing_browse_")
+            )
+        elif data.startswith("repricing_select_"):
+            offer_id = self._safe_parse_idx(data, "repricing_select_")
+            loop = asyncio.get_running_loop()
+            offer = (
+                await loop.run_in_executor(
+                    _executor, self.ggsel_api.get_v2_offer, offer_id
+                )
+                if offer_id > 0
+                else None
+            )
+            if not offer:
+                await self.telegram_bot.edit_message(
+                    message_id,
+                    chat_id,
+                    "❌ Could not verify that GGSEL offer.",
+                    [[InlineKeyboardButton("◀️ Back", callback_data="repricing_browse_1")]],
+                )
+                return
+            title = " ".join(
+                str(offer.get("title_en") or offer.get("title_ru") or f"Offer {offer_id}").split()
+            )[:80]
+            current_target = getattr(self.config, "repricing_targets_usd", {}).get(offer_id)
+            self.awaiting_input[chat_id] = {
+                "type": "repricing_target",
+                "product_id": offer_id,
+            }
+            await self.telegram_bot.edit_message(
+                message_id,
+                chat_id,
+                f"Selected: {title}\nID: {offer_id}\nCurrent GGSEL price: {float(offer['price']):g} RUB"
+                + (f"\nCurrent target: ${current_target:.2f}" if current_target else "")
+                + "\n\nSend the desired target USD amount only.\nExample: 10.50",
+                [[InlineKeyboardButton("❌ Cancel", callback_data="repricing_menu")]],
+            )
+        elif data == "repricing_add":
+            self.awaiting_input[chat_id] = {"type": "repricing_target"}
+            await self.telegram_bot.edit_message(
+                message_id,
+                chat_id,
+                "Send the GGSEL product ID and target USD amount separated by a space.\n\nExample: 123456 10.50",
+                [[InlineKeyboardButton("❌ Cancel", callback_data="repricing_menu")]],
+            )
+        elif data == "repricing_remove":
+            self.awaiting_input[chat_id] = {"type": "repricing_remove"}
+            await self.telegram_bot.edit_message(
+                message_id,
+                chat_id,
+                "Send the GGSEL product ID to remove.",
+                [[InlineKeyboardButton("❌ Cancel", callback_data="repricing_menu")]],
+            )
+        elif data == "repricing_toggle":
+            targets = dict(getattr(self.config, "repricing_targets_usd", {}))
+            try:
+                self._store_repricing_settings(
+                    not getattr(self.config, "repricing_dry_run", False), targets
+                )
+                notice = "✅ Dry-run setting saved."
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                logging.warning("Could not toggle repricing dry-run: %s", exc)
+                notice = f"❌ {exc}"
+            await self.show_repricing_menu(chat_id, message_id, notice)
+        elif data == "repricing_live_toggle":
+            targets = dict(getattr(self.config, "repricing_targets_usd", {}))
+            if getattr(self.config, "repricing_live_enabled", False):
+                try:
+                    self._store_repricing_live_settings(False, targets)
+                    notice = "✅ Daily live updates disabled."
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    logging.warning("Could not disable live repricing: %s", exc)
+                    notice = f"❌ {exc}"
+                await self.show_repricing_menu(chat_id, message_id, notice)
+            else:
+                await self.telegram_bot.edit_message(
+                    message_id,
+                    chat_id,
+                    "⚠️ LIVE PRICE UPDATE\n\nThis changes every configured GGSEL offer at most once per 24 hours. Changes above the configured safety limit are blocked.\n\nConfirm enabling real price updates.",
+                    [
+                        [InlineKeyboardButton("⚠️ Confirm live updates", callback_data="repricing_live_confirm")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data="repricing_menu")],
+                    ],
+                )
+        elif data == "repricing_live_confirm":
+            targets = dict(getattr(self.config, "repricing_targets_usd", {}))
+            try:
+                self._store_repricing_live_settings(True, targets)
+                notice = "⚠️ Daily live price updates enabled."
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                logging.warning("Could not enable live repricing: %s", exc)
+                notice = f"❌ {exc}"
+            await self.show_repricing_menu(chat_id, message_id, notice)
         elif data == "auto_toggle": self.autoresponder.toggle_enabled(); await self.show_auto_menu(chat_id, message_id)
         elif data == "auto_first_toggle": self.autoresponder.toggle_first_message(); await self.show_auto_menu(chat_id, message_id)
         elif data == "auto_first_edit":
@@ -1150,16 +1315,129 @@ class BotService:
             text_prompt = _("prompt_csv_name").replace("{current}", rule.get("option_name", "") if rule else "")
             await self.telegram_bot.edit_message(message_id, chat_id, text_prompt, [[InlineKeyboardButton(_("btn_cancel"), callback_data=f"csv_rule_{idx}")]])
         elif data.startswith("csv_del_"): idx = self._safe_parse_idx(data, "csv_del_"); self.autoresponder.remove_csv_rule(idx); await self.show_csv_menu(chat_id, message_id)
-    
+        elif data == "analysis_menu":
+            self.awaiting_input[chat_id] = {"type": "analysis_product"}
+            await self.telegram_bot.edit_message(
+                message_id,
+                chat_id,
+                "📊 **Competitive Analysis**\n\n"
+                "Enter your **product ID**:\n\n"
+                "**Example:** `102368933`\n\n"
+                "The category will be auto-detected from your product page.\n\n"
+                "💡 Find your product ID from GGSEL product URL:\n"
+                "`https://ggsel.net/catalog/product/102368933`",
+                [[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]],
+            )
+
+    async def show_repricing_menu(
+        self, chat_id: int, message_id: int, notice: str = ""
+    ) -> None:
+        dry_run = getattr(self.config, "repricing_dry_run", False)
+        live = getattr(self.config, "repricing_live_enabled", False)
+        targets = sorted(getattr(self.config, "repricing_targets_usd", {}).items())
+        mode = "⚠️ LIVE — updates every 24 hours" if live else (
+            "✅ DRY RUN — simulation only" if dry_run else "❌ disabled"
+        )
+        lines = [
+            "💱 Price control",
+            "",
+            f"Status: {mode}",
+            "Dry run only shows proposals; live mode changes GGSEL prices.",
+            "Targets are desired USD amounts:",
+        ]
+        lines.extend(
+            f"• {product_id}: ${target_usd:.2f}"
+            for product_id, target_usd in targets[:30]
+        )
+        if not targets:
+            lines.append("• No products configured")
+        elif len(targets) > 30:
+            lines.append(f"• …and {len(targets) - 30} more")
+        if notice:
+            lines.extend(("", notice))
+        keyboard = [
+            [InlineKeyboardButton("📦 Browse GGSEL products", callback_data="repricing_browse_1")],
+            [InlineKeyboardButton("⌨️ Add / update by ID", callback_data="repricing_add")],
+            [InlineKeyboardButton("➖ Remove product", callback_data="repricing_remove")],
+            [InlineKeyboardButton(
+                "⏸ Disable dry run" if dry_run else "▶️ Enable dry run",
+                callback_data="repricing_toggle",
+            )],
+            [InlineKeyboardButton(
+                "⏸ Disable LIVE updates" if live else "⚠️ Enable LIVE updates",
+                callback_data="repricing_live_toggle",
+            )],
+            [InlineKeyboardButton("◀️ Back", callback_data="main_menu")],
+        ]
+        await self.telegram_bot.edit_message(
+            message_id, chat_id, "\n".join(lines), keyboard
+        )
+
+    async def show_repricing_offer_picker(
+        self, chat_id: int, message_id: int, page: int = 1
+    ) -> None:
+        if not 1 <= page <= 1000:
+            await self.show_repricing_menu(chat_id, message_id, "❌ Invalid page.")
+            return
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _executor, self.ggsel_api.list_v2_offers, page, 8
+        )
+        if not result:
+            await self.telegram_bot.edit_message(
+                message_id,
+                chat_id,
+                "❌ Could not load GGSEL products. Check the V2 API key and its offer permissions.",
+                [
+                    [InlineKeyboardButton("⌨️ Add by ID", callback_data="repricing_add")],
+                    [InlineKeyboardButton("◀️ Back", callback_data="repricing_menu")],
+                ],
+            )
+            return
+        targets = getattr(self.config, "repricing_targets_usd", {})
+        keyboard = []
+        for offer in result["offers"]:
+            offer_id = int(offer["id"])
+            title = " ".join(
+                str(offer.get("title_en") or offer.get("title_ru") or "Untitled").split()
+            )
+            marker = "✅" if offer_id in targets else "▫️"
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{marker} {offer_id} · {title}"[:64],
+                        callback_data=f"repricing_select_{offer_id}",
+                    )
+                ]
+            )
+        navigation = []
+        if result["has_previous_page"]:
+            navigation.append(
+                InlineKeyboardButton("⬅️ Previous", callback_data=f"repricing_browse_{page - 1}")
+            )
+        if result["has_next_page"]:
+            navigation.append(
+                InlineKeyboardButton("Next ➡️", callback_data=f"repricing_browse_{page + 1}")
+            )
+        if navigation:
+            keyboard.append(navigation)
+        keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="repricing_menu")])
+        await self.telegram_bot.edit_message(
+            message_id,
+            chat_id,
+            f"📦 GGSEL products · page {page}\n\nChoose a product, then send its target USD amount.\n✅ already configured. This list is read-only.",
+            keyboard,
+        )
+
     async def show_auto_menu(self, chat_id: int, message_id: int):
         enabled = self.autoresponder.is_enabled()
         first_enabled = self.autoresponder.is_first_message_enabled()
         triggers_count = len(self.autoresponder.get_triggers())
         review_enabled = self.autoresponder.is_review_responses_enabled()
         csv_enabled = self.autoresponder.is_csv_mode_enabled()
-        
+
         text = f"{_('auto_title')}\n\n{_('auto_status')} {_('enabled') if enabled else _('disabled')}\n{_('auto_greeting')} {'✅' if first_enabled else '❌'}\n{_('auto_triggers')} {triggers_count}\n{_('auto_reviews')} {'✅' if review_enabled else '❌'}\n{_('auto_csv')} {'✅' if csv_enabled else '❌'} ({len(self.autoresponder.get_csv_rules())})"
-        
+
         keyboard = [
             [InlineKeyboardButton(f"{_('btn_turn_off') if enabled else _('btn_turn_on')}", callback_data="auto_toggle")],
             [InlineKeyboardButton(f"{_('btn_greeting')} {'✅' if first_enabled else '❌'}", callback_data="auto_first_toggle")],
@@ -1173,12 +1451,12 @@ class BotService:
 
     async def send_auto_menu_new(self, chat_id: int):
         await self.telegram_bot.send_message_with_keyboard(_('auto_title'), [[InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")]], None)
-         
+
     async def show_csv_menu(self, chat_id: int, message_id: int):
         enabled = self.autoresponder.is_csv_mode_enabled()
         rules = self.autoresponder.get_csv_rules()
         text = f"{_('csv_title')}\n\n{_('auto_status')} ✅ {_('enabled') if enabled else '❌ ' + _('disabled')}\n\n{_('csv_desc')}\n\n"
-        
+
         if rules:
             text += f"📋 Rules ({len(rules)}):\n"
             for i, rule in enumerate(rules):
@@ -1186,7 +1464,7 @@ class BotService:
                 name = rule.get("option_name", "")[:15]
                 text += f"{i+1}. {status} 📝 {name}\n"
         else: text += _('csv_rules_empty')
-        
+
         keyboard = [[InlineKeyboardButton(f"{_('btn_turn_off') if enabled else _('btn_turn_on')}", callback_data="csv_toggle")]]
         for i, rule in enumerate(rules):
             status = "✅" if rule.get("enabled", True) else "❌"
@@ -1195,19 +1473,19 @@ class BotService:
         keyboard.append([InlineKeyboardButton(_("btn_add_rule"), callback_data="csv_add_rule")])
         keyboard.append([InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")])
         await self.telegram_bot.edit_message(message_id, chat_id, text, keyboard)
-    
+
     async def show_csv_rule_menu(self, chat_id: int, message_id: int, idx: int):
         rule = self.autoresponder.get_csv_rule(idx)
         if not rule: return await self.show_csv_menu(chat_id, message_id)
-        
+
         enabled = rule.get("enabled", True)
         option_name = rule.get("option_name", "")
         option_value = rule.get("option_value", "")
         send_to_user = rule.get("send_to_user", False)
         send_to_topic = rule.get("send_to_topic", True)
-        
+
         text = f"{_('csv_rule_title')} #{idx+1}\n\n{_('csv_option')} {option_name}\n{_('auto_status')} {'✅' if enabled else '❌'}\n\n"
-        
+
         keyboard = [
             [InlineKeyboardButton(f"{_('btn_turn_off') if enabled else _('btn_turn_on')}", callback_data=f"csv_toggle_{idx}")],
             [InlineKeyboardButton(_("btn_edit_name"), callback_data=f"csv_name_{idx}")],
@@ -1219,7 +1497,7 @@ class BotService:
         if send_to_topic: keyboard.append([InlineKeyboardButton(_("btn_edit_topic_msg"), callback_data=f"csv_topicmsg_{idx}")])
         keyboard.append([InlineKeyboardButton(_("btn_delete"), callback_data=f"csv_del_{idx}"), InlineKeyboardButton(_("btn_back"), callback_data="csv_menu")])
         await self.telegram_bot.edit_message(message_id, chat_id, text, keyboard)
-    
+
     async def show_triggers_menu(self, chat_id: int, message_id: int):
         triggers = self.autoresponder.get_triggers()
         text = f"{_('triggers_title')}\n\n"
@@ -1232,15 +1510,15 @@ class BotService:
         if not triggers: text += _('triggers_empty')
         keyboard.append([InlineKeyboardButton(_("btn_add_trigger"), callback_data="auto_add_trigger"), InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")])
         await self.telegram_bot.edit_message(message_id, chat_id, text, keyboard)
-    
+
     async def show_trigger_edit_menu(self, chat_id: int, message_id: int, idx: int):
         trigger = self.autoresponder.get_trigger(idx)
         if not trigger: return await self.show_triggers_menu(chat_id, message_id)
-        
+
         enabled = trigger.get('enabled', True)
         notify = trigger.get('notify_group', False)
         exact_match = trigger.get('exact_match', False)
-        
+
         text = f"{_('trigger_edit_title')} #{idx+1}\n\n{_('trigger_phrase')} {trigger.get('phrase', '')}\n{_('auto_status')} {'✅' if enabled else '❌'}\n"
         keyboard = [
             [InlineKeyboardButton(f"{_('btn_turn_off') if enabled else _('btn_turn_on')}", callback_data=f"auto_trigger_toggle_{idx}")],
@@ -1251,7 +1529,7 @@ class BotService:
         ]
         if notify: keyboard.insert(4, [InlineKeyboardButton(_("btn_edit_notify_text"), callback_data=f"auto_trigger_notifytext_{idx}")])
         await self.telegram_bot.edit_message(message_id, chat_id, text, keyboard)
-    
+
     async def show_reviews_menu(self, chat_id: int, message_id: int):
         enabled = self.autoresponder.is_review_responses_enabled()
         good_enabled = self.autoresponder.is_good_review_response_enabled()
@@ -1264,12 +1542,64 @@ class BotService:
             [InlineKeyboardButton(_("btn_back"), callback_data="auto_menu")]
         ]
         await self.telegram_bot.edit_message(message_id, chat_id, text, keyboard)
-    
+
     async def handle_text_input(self, chat_id: int, text: str):
         if chat_id not in self.awaiting_input: return False
         input_type = self.awaiting_input[chat_id].get("type")
-        
-        if input_type == "first_message":
+
+        if input_type == "repricing_target":
+            selected_product_id = self.awaiting_input[chat_id].get("product_id")
+            try:
+                product_id, target_usd = parse_repricing_target(
+                    f"{selected_product_id} {text}" if selected_product_id else text
+                )
+                targets = dict(getattr(self.config, "repricing_targets_usd", {}))
+                targets[product_id] = target_usd
+                self._store_repricing_settings(
+                    getattr(self.config, "repricing_dry_run", False), targets
+                )
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                retry_format = "TARGET_USD" if selected_product_id else "PRODUCT_ID TARGET_USD"
+                await self.telegram_bot.send_message_with_keyboard(
+                    f"❌ {exc}\n\nTry again: {retry_format}",
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="repricing_menu")]],
+                    None,
+                )
+                return True
+            del self.awaiting_input[chat_id]
+            await self.telegram_bot.send_message_with_keyboard(
+                f"✅ Product {product_id} saved with target ${target_usd:.2f}.",
+                [[InlineKeyboardButton("◀️ Back", callback_data="repricing_menu")]],
+                None,
+            )
+            return True
+        elif input_type == "repricing_remove":
+            try:
+                product_id = int(text.strip())
+                targets = dict(getattr(self.config, "repricing_targets_usd", {}))
+                if product_id <= 0 or product_id not in targets:
+                    raise ValueError("configured product ID not found")
+                del targets[product_id]
+                self._store_repricing_settings(
+                    bool(targets) and getattr(self.config, "repricing_dry_run", False),
+                    targets,
+                )
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                await self.telegram_bot.send_message_with_keyboard(
+                    f"❌ {exc}\n\nSend a configured product ID.",
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="repricing_menu")]],
+                    None,
+                )
+                return True
+            del self.awaiting_input[chat_id]
+            await self.telegram_bot.send_message_with_keyboard(
+                f"✅ Product {product_id} removed."
+                + (" Dry-run disabled because no targets remain." if not targets else ""),
+                [[InlineKeyboardButton("◀️ Back", callback_data="repricing_menu")]],
+                None,
+            )
+            return True
+        elif input_type == "first_message":
             self.autoresponder.set_first_message_text(text)
             del self.awaiting_input[chat_id]
             await self.telegram_bot.send_message_with_keyboard(f"✅ Greeting text updated:\n\n{text}", [[InlineKeyboardButton("◀️ Back", callback_data="auto_menu")]], None)
@@ -1341,6 +1671,84 @@ class BotService:
             idx = self.awaiting_input[chat_id].get("rule_idx"); self.autoresponder.update_csv_rule(idx, topic_message=text); del self.awaiting_input[chat_id]
             await self.telegram_bot.send_message_with_keyboard(f"✅ Topic message updated!", [[InlineKeyboardButton("◀️ Back", callback_data=f"csv_rule_{idx}")]], None)
             return True
+        elif input_type == "analysis_product":
+            del self.awaiting_input[chat_id]
+            try:
+                product_id = int(text.strip())
+                
+                await self.telegram_bot.send_message_with_keyboard(
+                    f"🔍 Analyzing product {product_id}...\n\n"
+                    f"⏳ This may take 20-40 seconds:\n"
+                    f"• Auto-detecting category\n"
+                    f"• Scraping competitor data\n"
+                    f"• Calculating recommendations",
+                    [[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]],
+                    None,
+                )
+                
+                loop = asyncio.get_running_loop()
+                recommendation = await loop.run_in_executor(
+                    _executor,
+                    self.competitive_analyzer.analyze_product_in_category,
+                    product_id,
+                    None,  # Let it auto-detect category
+                )
+                
+                if not recommendation:
+                    await self.telegram_bot.send_message_with_keyboard(
+                        f"❌ Could not analyze product {product_id}\n\n"
+                        f"Possible reasons:\n"
+                        f"• Product not found\n"
+                        f"• Failed to detect category\n"
+                        f"• No competitors found in category\n"
+                        f"• Product page unavailable",
+                        [[InlineKeyboardButton("🔄 Try again", callback_data="analysis_menu")],
+                         [InlineKeyboardButton("◀️ Back", callback_data="main_menu")]],
+                        None,
+                    )
+                    return True
+                
+                report = self.competitive_analyzer.format_recommendation(recommendation)
+                
+                # Split long reports into chunks
+                max_length = 3900
+                if len(report) <= max_length:
+                    await self.telegram_bot.send_message_with_keyboard(
+                        report,
+                        [[InlineKeyboardButton("🔄 Analyze again", callback_data="analysis_menu")],
+                         [InlineKeyboardButton("◀️ Back", callback_data="main_menu")]],
+                        None,
+                    )
+                else:
+                    chunks = [report[i:i+max_length] for i in range(0, len(report), max_length)]
+                    for i, chunk in enumerate(chunks):
+                        if i == len(chunks) - 1:
+                            await self.telegram_bot.send_message_with_keyboard(
+                                chunk,
+                                [[InlineKeyboardButton("🔄 Analyze again", callback_data="analysis_menu")],
+                                 [InlineKeyboardButton("◀️ Back", callback_data="main_menu")]],
+                                None,
+                            )
+                        else:
+                            await self.telegram_bot.send_message_with_keyboard(chunk, None, None)
+                        await asyncio.sleep(0.5)
+                
+            except ValueError as exc:
+                await self.telegram_bot.send_message_with_keyboard(
+                    f"❌ Invalid product ID\n\n"
+                    f"Please enter a numeric product ID.\n"
+                    f"**Example:** `102368933`",
+                    [[InlineKeyboardButton("◀️ Back", callback_data="analysis_menu")]],
+                    None,
+                )
+            except Exception as exc:
+                logging.error(f"Analysis error: {exc}", exc_info=True)
+                await self.telegram_bot.send_message_with_keyboard(
+                    f"❌ Analysis failed: {exc}",
+                    [[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]],
+                    None,
+                )
+            return True
         return False
 
     async def sync_topics_with_purchases(self):
@@ -1411,18 +1819,18 @@ class BotService:
                 time.monotonic() - started_at,
                 result,
             )
-    
+
     async def check_deleted_topics(self):
         all_topics = self.topic_manager.get_all_topics()
         purchase_topics = {k: v for k, v in all_topics.items() if k.startswith('purchase_')}
         if not purchase_topics: return
-        
+
         for topic_key, topic_info in list(purchase_topics.items()):
             topic_id = topic_info.get('topic_id')
             topic_name = topic_info.get('topic_name', '💬')
             invoice_id = topic_info.get('invoice_id')
             if not topic_id or not topic_name: continue
-            
+
             if not await self.telegram_bot.check_topic_exists(topic_id, topic_name):
                 logging.info(f"Topic {topic_id} (invoice {invoice_id}) deleted, recreating...")
                 self.topic_manager.remove_topic(topic_key)
@@ -1433,7 +1841,7 @@ class BotService:
                         purchase = self.purchase_manager.parse_purchase_response(purchase_data, invoice_id)
                         if purchase: await self.create_topic_for_purchase(purchase, skip_greeting=True)
             await asyncio.sleep(0.5)
-    
+
     async def check_new_reviews(self):
         if self._review_lock.locked():
             return
@@ -1462,7 +1870,7 @@ class BotService:
                 page_ids = [int(r.get('id', 0)) for r in reviews_data['reviews'] if r.get('id')]
                 if page_ids and max(page_ids) <= max_known_id and all(str(rid) in self.processed_reviews for rid in page_ids): break
                 await asyncio.sleep(0.3)
-            
+
             if all_reviews:
                 all_reviews.sort(key=lambda r: int(r.get('id', 0)), reverse=True)
                 await self._process_reviews(all_reviews, invoice_to_topic, loop)
@@ -1472,11 +1880,11 @@ class BotService:
         for review in reviews:
             review_id = str(review.get('id', ''))
             if not review_id: continue
-            
+
             review_type = review.get('type', 'good')
             info = review.get('info', '') or review.get('text', '') or ''
             review_hash = f"{review_type}:{info}"
-            
+
             old_hash = self.processed_reviews.get(review_id)
             if old_hash == review_hash: continue
             is_updated = old_hash is not None
@@ -1485,14 +1893,14 @@ class BotService:
             topic_info = invoice_to_topic.get(int(invoice_id)) if invoice_id else None
             topic_id = topic_info.get('topic_id') if topic_info else None
             if not topic_id: continue
-            
+
             emoji = "👍" if review_type == 'good' else "👎"
             prefix = f"✏️ Review changed! {emoji}" if is_updated else f"{emoji} New review!"
             msg = f"{prefix}\n📊 Type: {'Positive' if review_type == 'good' else 'Negative'}\n"
             if review.get('name'): msg += f"📦 {review['name']}\n"
             if review.get('date'): msg += f"📅 {review['date']}\n"
             if info: msg += f"\n💬 {info}"
-            
+
             notification_accepted = await self.send_message_with_cooldown(
                 msg,
                 topic_id,
@@ -1500,7 +1908,7 @@ class BotService:
             )
             if not notification_accepted:
                 continue
-            
+
             auto_response = self.autoresponder.get_review_response(review_type)
             if auto_response:
                 try:
@@ -1537,7 +1945,7 @@ class BotService:
             target_topic = self.topic_manager.get_topic_by_topic_id(topic_id)
             if not target_topic: return await self.telegram_bot.send_message("❌ Topic not found in DB", topic_id)
             if not target_topic.get('invoice_id'): return await self.telegram_bot.send_message("❌ No invoice_id", topic_id)
-            
+
             await self.telegram_bot.send_message("🔄 Loading history...", topic_id)
             await self.load_chat_history([target_topic['invoice_id']], topic_id, force_reload=True)
             await self.telegram_bot.send_message("✅ History loaded", topic_id)
@@ -1546,7 +1954,7 @@ class BotService:
     async def get_purchase_options(self, invoice_id: int) -> Optional[str]:
         text, _ = await self.get_purchase_options_with_list(invoice_id)
         return text
-    
+
     async def get_purchase_options_with_list(self, invoice_id: int) -> tuple:
         try:
             loop = asyncio.get_event_loop()
@@ -1554,23 +1962,23 @@ class BotService:
             if not purchase_data or purchase_data.get('retval') != 0: return None, []
             options = purchase_data.get('content', {}).get('options', [])
             if not options: return None, []
-            
+
             lines = [f"• {opt.get('name')}: {opt.get('user_data')}" for opt in options if opt.get('name') and opt.get('user_data')]
             return "\n".join(lines) if lines else None, options
         except Exception as e: logging.error(f"Options fetch error: {e}"); return None, []
-    
+
     async def process_csv_rules(self, invoice_id: int, topic_id: int, options: list):
         try:
             results = self.autoresponder.check_csv_options(options)
             if not results: return
             loop = asyncio.get_event_loop()
-            
+
             for result in results:
                 option_name, option_value = result.get("option_name", ""), result.get("option_value", "")
                 if result.get("send_to_topic") and result.get("topic_message"):
                     topic_msg = result["topic_message"].replace("{option}", option_name).replace("{value}", option_value).replace("{sum}", option_value)
                     await self.send_message_with_cooldown(f"🎯 {topic_msg}", topic_id)
-                
+
                 if result.get("send_to_user") and result.get("user_message"):
                     user_msg = result["user_message"].replace("{option}", option_name).replace("{value}", option_value).replace("{sum}", option_value)
                     try:
@@ -1578,13 +1986,13 @@ class BotService:
                             await self.send_message_with_cooldown(f"📤 {user_msg}", topic_id)
                     except Exception as e: logging.error(f"CSV User msg error: {e}")
         except Exception as e: logging.error(f"CSV process error: {e}")
-    
+
     async def handle_options_command(self, topic_id: int):
         try:
             target_topic = self.topic_manager.get_topic_by_topic_id(topic_id)
             if not target_topic: return await self.telegram_bot.send_message("❌ Topic not found", topic_id)
             if not target_topic.get('invoice_id'): return await self.telegram_bot.send_message("❌ No invoice_id", topic_id)
-            
+
             options_text = await self.get_purchase_options(target_topic['invoice_id'])
             msg = f"⚙️ Purchase options #{target_topic['invoice_id']}:\n\n{options_text}" if options_text else f"ℹ️ No options for purchase #{target_topic['invoice_id']}"
             await self.telegram_bot.send_message(msg, topic_id)
@@ -1596,11 +2004,11 @@ class BotService:
             if not target_topic: return await self.telegram_bot.send_message("❌ Topic not found", topic_id)
             invoice_id = target_topic.get('invoice_id')
             if not invoice_id: return await self.telegram_bot.send_message("❌ No invoice_id", topic_id)
-            
+
             await self.telegram_bot.send_message(f"🔍 Searching for review #{invoice_id}...", topic_id)
             loop = asyncio.get_event_loop()
             review = await loop.run_in_executor(_executor, lambda: self.ggsel_api.get_review_by_invoice(invoice_id))
-            
+
             if review:
                 emoji = "👍" if review.get('type') == 'good' else "👎"
                 msg = f"{emoji} Review found!\n\n🆔 ID: {review.get('id')}\n"
@@ -1625,7 +2033,7 @@ class BotService:
             if not data or data.get("retval") != 0:
                 raise RuntimeError("Failed to fetch GGSel balance")
             content = data.get("content", {})
-            
+
             avail, hold = float(content.get("amount_t_free") or 0.0), float(content.get("amount_t_lock") or 0.0)
             text = f"{_('balance_header')}{_('balance_body').format(total=f'{avail+hold:.2f}', avail=f'{avail:.2f}', hold=f'{hold:.2f}', curr='USD')}"
             await self.telegram_bot.edit_message(query.message.message_id, query.message.chat.id, text, self.get_balance_markup().inline_keyboard)
@@ -1689,25 +2097,174 @@ class BotService:
 
         await self.telegram_bot.send_message(alert, -1, parse_mode="Markdown")
         self.last_available_balance = current_avail
-                
+
+    async def _run_repricing_dry_run(
+        self, raw_cbr_rate: float, rate_timestamp: datetime
+    ) -> None:
+        if not getattr(self.config, "repricing_dry_run", False):
+            return
+        if not 20 <= raw_cbr_rate <= 300:
+            logging.warning(
+                "REPRICING DRY RUN skipped: CBR rate is outside the safe range"
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        if rate_timestamp.tzinfo is None:
+            logging.warning("REPRICING DRY RUN skipped: CBR timestamp has no timezone")
+            return
+        age = now - rate_timestamp.astimezone(timezone.utc)
+        if age < -timedelta(minutes=5) or age > timedelta(hours=48):
+            logging.warning(
+                "REPRICING DRY RUN skipped: stale or future CBR timestamp rate_at=%s",
+                rate_timestamp.isoformat(),
+            )
+            return
+
+        targets = getattr(self.config, "repricing_targets_usd", {})
+        loop = asyncio.get_running_loop()
+        for product_id, target_usd in sorted(targets.items()):
+            product = await loop.run_in_executor(
+                _executor, self.ggsel_api.get_product_info, product_id
+            )
+            current_rub = current_rub_price(product) if product else None
+            if current_rub is None:
+                logging.warning(
+                    "REPRICING DRY RUN product_id=%s status=SKIPPED reason=current_rub_unavailable",
+                    product_id,
+                )
+                continue
+
+            proposed_rub = calculate_repricing_rub(
+                target_usd,
+                raw_cbr_rate,
+                getattr(self.config, "repricing_fee_percent", 0.0),
+                getattr(self.config, "repricing_fixed_rub", 0.0),
+            )
+            change_percent = abs(proposed_rub - current_rub) / current_rub * 100
+            max_change = getattr(self.config, "repricing_max_change_percent", 15.0)
+            status = "BLOCKED" if change_percent > max_change else "PROPOSED"
+            logging.info(
+                "REPRICING DRY RUN product_id=%s current_rub=%.2f target_usd=%.2f "
+                "cbr_rate=%.4f rate_at=%s proposed_rub=%s change_percent=%.2f status=%s",
+                product_id,
+                current_rub,
+                target_usd,
+                raw_cbr_rate,
+                rate_timestamp.isoformat(),
+                proposed_rub,
+                change_percent,
+                status,
+            )
+
+    def _claim_daily_repricing_run(self) -> bool:
+        now = datetime.now(timezone.utc)
+        saved = self.database.get_setting("repricing_live_last_run_at")
+        if saved:
+            try:
+                last_run = datetime.fromisoformat(saved)
+            except ValueError:
+                logging.error("LIVE REPRICING blocked: invalid last-run checkpoint")
+                return False
+            if last_run.tzinfo is None or now - last_run < timedelta(hours=24):
+                return False
+        try:
+            self.database.set_setting(
+                "repricing_live_last_run_at", now.isoformat()
+            )
+        except (OSError, sqlite3.Error) as exc:
+            logging.error("LIVE REPRICING blocked: checkpoint failed: %s", exc)
+            return False
+        return True
+
+    async def _run_repricing_live(
+        self, raw_cbr_rate: float, rate_timestamp: datetime
+    ) -> None:
+        if not getattr(self.config, "repricing_live_enabled", False):
+            return
+        if getattr(self.config, "ggsel_v2_price_write_enabled", False) is not True:
+            logging.error("LIVE REPRICING blocked: server write gate is disabled")
+            return
+        if not 20 <= raw_cbr_rate <= 300 or rate_timestamp.tzinfo is None:
+            logging.warning("LIVE REPRICING skipped: unsafe CBR rate or timestamp")
+            return
+        age = datetime.now(timezone.utc) - rate_timestamp.astimezone(timezone.utc)
+        if age < -timedelta(minutes=5) or age > timedelta(hours=48):
+            logging.warning("LIVE REPRICING skipped: stale or future CBR timestamp")
+            return
+        if not self._claim_daily_repricing_run():
+            return
+
+        loop = asyncio.get_running_loop()
+        for offer_id, target_usd in sorted(
+            getattr(self.config, "repricing_targets_usd", {}).items()
+        ):
+            proposed_rub = calculate_repricing_rub(
+                target_usd,
+                raw_cbr_rate,
+                getattr(self.config, "repricing_fee_percent", 0.0),
+                getattr(self.config, "repricing_fixed_rub", 0.0),
+            )
+            verified = await loop.run_in_executor(
+                _executor,
+                self.ggsel_api.update_v2_offer_price,
+                offer_id,
+                proposed_rub,
+            )
+            if verified is None:
+                logging.error(
+                    "LIVE REPRICING offer_id=%s proposed_rub=%s status=BLOCKED_OR_FAILED",
+                    offer_id,
+                    proposed_rub,
+                )
+                continue
+            logging.info(
+                "LIVE REPRICING offer_id=%s target_usd=%.2f cbr_rate=%.4f "
+                "proposed_rub=%s verified_rub=%.2f status=VERIFIED",
+                offer_id,
+                target_usd,
+                raw_cbr_rate,
+                proposed_rub,
+                float(verified["price"]),
+            )
+        # ponytail: one batch checkpoint favors no duplicate financial writes;
+        # persist per-offer attempts if same-day recovery is later required.
+
     async def update_exchange_rate_loop(self):
-        """Fetches the official CBR exchange rate every 12 hours"""
+        """Fetch the official CBR exchange rate every 12 hours."""
         logging.info("Starting Exchange Rate updater...")
         import httpx
         while self.running:
             try:
-                # Free public API for Russian Central Bank daily rates
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get("https://www.cbr-xml-daily.ru/daily_json.js")
                     if resp.status_code == 200:
                         data = resp.json()
-                        raw_cbr_rate = float(data['Valute']['USD']['Value'])
-                        
-                        # Add GGSel's ~1.3% hidden conversion markup
-                        self.usd_rub_rate = raw_cbr_rate * 1.013 
-                        logging.info(f"✅ USD/RUB Rate updated: {self.usd_rub_rate:.2f} (CBR: {raw_cbr_rate:.2f})")
+                        raw_cbr_rate = float(data["Valute"]["USD"]["Value"])
+                        rate_timestamp = datetime.fromisoformat(
+                            str(data["Timestamp"]).replace("Z", "+00:00")
+                        )
+
+                        # Existing reporting estimate; dry-run pricing uses raw CBR plus configured fees.
+                        self.usd_rub_rate = raw_cbr_rate * 1.013
+                        logging.info(
+                            "USD/RUB rate updated: %.2f (CBR: %.2f)",
+                            self.usd_rub_rate,
+                            raw_cbr_rate,
+                        )
+                        if getattr(self.config, "repricing_live_enabled", False):
+                            await self._run_sync_operation(
+                                lambda: self._run_repricing_live(
+                                    raw_cbr_rate, rate_timestamp
+                                )
+                            )
+                        elif getattr(self.config, "repricing_dry_run", False):
+                            await self._run_sync_operation(
+                                lambda: self._run_repricing_dry_run(
+                                    raw_cbr_rate, rate_timestamp
+                                )
+                            )
             except Exception as e:
-                logging.warning(f"⚠️ Failed to fetch exchange rate, using fallback: {e}")
-            
-            # Sleep for 12 hours before checking again
+                logging.warning("Failed to fetch exchange rate; using reporting fallback: %s", e)
+
             await asyncio.sleep(43200)

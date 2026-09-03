@@ -112,6 +112,7 @@ class TelegramBot:
         keyboard = [
             [InlineKeyboardButton(_("btn_auto"), callback_data="auto_menu")],
             [InlineKeyboardButton(_("btn_balance"), callback_data="check_balance")],
+            [InlineKeyboardButton("💱 Price dry-run", callback_data="repricing_menu")],
             [InlineKeyboardButton(_("btn_stats"), callback_data="stats")],
             [InlineKeyboardButton(_("btn_lang"), callback_data="lang_toggle")],
             [InlineKeyboardButton(_("btn_close"), callback_data="close")]

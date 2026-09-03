@@ -13,3 +13,4 @@ __pycache__/
 autoresponder.json
 bot_code.tar.gz
 check_image.py
+backups/

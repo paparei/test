@@ -1,7 +1,10 @@
+import argparse
 import hashlib
 import logging
+import math
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -69,6 +72,7 @@ def create_ggsel_session(
 
 class GGSelAPI:
     DEFAULT_TIMEOUT: Tuple[float, float] = (5.0, 30.0)
+    V2_BASE_URL = "https://seller.ggsel.com/api_sellers/v2"
     MAX_MESSAGE_LENGTH = 4000
     RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
@@ -83,7 +87,13 @@ class GGSelAPI:
         self.last_failure: Optional[APIFailure] = None
         self._session_local = threading.local()
         self._login_lock = threading.Lock()
+        # ponytail: process-local serialization; add a distributed lock before multiple writer replicas.
+        self._v2_price_write_lock = threading.Lock()
+        self._v2_write_session = create_ggsel_session(0, self.timeout)
         self._auth_blocked_until = 0.0
+        self._product_lookup_blocked_until = 0.0
+        # ponytail: process-local cache; add TTL/shared storage if names change or replicas multiply.
+        self._product_name_cache: Dict[int, str] = {}
         self.session = self._new_session()
 
     def _new_session(self) -> TimeoutSession:
@@ -160,6 +170,17 @@ class GGSelAPI:
         data = f"{self.config.ggsel_api_key}{timestamp}"
         return hashlib.sha256(data.encode()).hexdigest()
 
+    @staticmethod
+    def _retry_after_seconds(value: Any) -> float:
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            try:
+                delay = parsedate_to_datetime(str(value)).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                delay = 60.0
+        return min(3600.0, max(1.0, delay))
+
     def _set_http_failure(self, status_code: int) -> None:
         if status_code in (401, 403):
             self.last_failure = APIFailure.AUTHENTICATION
@@ -168,10 +189,19 @@ class GGSelAPI:
         else:
             self.last_failure = APIFailure.PERMANENT
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Optional[requests.Response]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        base_url: Optional[str] = None,
+        request_session: Optional[requests.Session] = None,
+        **kwargs: Any,
+    ) -> Optional[requests.Response]:
         kwargs["timeout"] = self.timeout
+        url = f"{base_url or self.base_url}/{path.lstrip('/')}"
         try:
-            response = self.session.request(method, self._url(path), **kwargs)
+            response = (request_session or self.session).request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError):
             self.last_failure = APIFailure.RETRYABLE
             logging.warning("GGSel API request failed due to a temporary transport error")
@@ -188,6 +218,27 @@ class GGSelAPI:
                 body = response.text
             except Exception:
                 pass
+            if response.status_code == 429:
+                headers = getattr(response, "headers", {})
+                retry_after = headers.get("Retry-After")
+                cooldown = self._retry_after_seconds(retry_after)
+                self._product_lookup_blocked_until = max(
+                    self._product_lookup_blocked_until,
+                    time.monotonic() + cooldown,
+                )
+                retry_history = getattr(
+                    getattr(getattr(response, "raw", None), "retries", None),
+                    "history",
+                    (),
+                )
+                logging.warning(
+                    "GGSel rate limit details: retry_after=%s remaining=%s reset=%s retries=%s cooldown=%ss",
+                    retry_after,
+                    headers.get("X-RateLimit-Remaining"),
+                    headers.get("X-RateLimit-Reset"),
+                    len(retry_history),
+                    cooldown,
+                )
             logging.warning(
                 "GGSel API returned HTTP %s for %s %s: %s",
                 response.status_code,
@@ -513,11 +564,14 @@ class GGSelAPI:
                     return review
         return None
 
-    def get_real_product_name(self, item_id: int) -> Optional[str]:
-        """Fetch a product name without placing the auth token in the URL."""
+    def get_product_info(self, item_id: int) -> Optional[Dict[str, Any]]:
+        """Read one V1 product without placing the auth token in the URL."""
         item_id = self._positive_int(item_id)
         if item_id is None:
             self.last_failure = APIFailure.PERMANENT
+            return None
+        if time.monotonic() < self._product_lookup_blocked_until:
+            self.last_failure = APIFailure.RETRYABLE
             return None
         response = self._authenticated_request(
             "GET",
@@ -531,10 +585,215 @@ class GGSelAPI:
             product = content.get("product") if isinstance(content, dict) else None
             if not isinstance(product, dict):
                 product = content
-        name = product.get("name") if isinstance(product, dict) else None
-        if isinstance(name, str) and name.strip():
+        if isinstance(product, dict):
             self.last_failure = None
-            return name.strip()
+            return product
         if response is not None:
             self.last_failure = APIFailure.PERMANENT
         return None
+
+    def list_v2_offers(
+        self, page: int = 1, limit: int = 10
+    ) -> Optional[Dict[str, Any]]:
+        """Read one validated page of public V2 offers."""
+        api_key = getattr(self.config, "ggsel_v2_api_key", "")
+        if (
+            isinstance(page, bool)
+            or not isinstance(page, int)
+            or page < 1
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 50
+            or not isinstance(api_key, str)
+            or not api_key.strip()
+        ):
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        response = self._request(
+            "GET",
+            "offers",
+            base_url=self.V2_BASE_URL,
+            params={"page": page, "limit": limit},
+            headers={
+                "Accept": "application/json",
+                "Authorization": api_key.strip(),
+            },
+        )
+        data = self._json(response) if response is not None else None
+        payload = data.get("data") if isinstance(data, dict) else None
+        if isinstance(payload, list):
+            offers = payload
+            pagination = data.get("pagination", data)
+        elif isinstance(payload, dict):
+            offers = payload.get("offers", payload.get("items"))
+            pagination = payload.get("pagination", data.get("pagination", payload))
+        else:
+            offers = data.get("offers", data.get("items")) if isinstance(data, dict) else None
+            pagination = data.get("pagination", data) if isinstance(data, dict) else None
+        if not isinstance(offers, list) or not isinstance(pagination, dict):
+            if response is not None:
+                self.last_failure = APIFailure.PERMANENT
+            return None
+        validated = []
+        for offer in offers:
+            if not isinstance(offer, dict) or self._positive_int(offer.get("id")) is None:
+                self.last_failure = APIFailure.PERMANENT
+                return None
+            validated.append(offer)
+        self.last_failure = None
+        return {
+            "offers": validated,
+            "page": page,
+            "has_next_page": pagination.get("has_next_page") is True,
+            "has_previous_page": page > 1 and pagination.get("has_previous_page") is not False,
+        }
+
+    def get_v2_offer(self, offer_id: int) -> Optional[Dict[str, Any]]:
+        """Read and validate one public V2 offer."""
+        offer_id = self._positive_int(offer_id)
+        api_key = getattr(self.config, "ggsel_v2_api_key", "")
+        if offer_id is None or not isinstance(api_key, str) or not api_key.strip():
+            self.last_failure = APIFailure.PERMANENT
+            return None
+
+        response = self._request(
+            "GET",
+            f"offers/{offer_id}",
+            base_url=self.V2_BASE_URL,
+            headers={
+                "Accept": "application/json",
+                "Authorization": api_key.strip(),
+            },
+        )
+        data = self._json(response) if response is not None else None
+        offer = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(offer, dict):
+            offer = data
+        if not isinstance(offer, dict) or self._positive_int(offer.get("id")) != offer_id:
+            if response is not None:
+                self.last_failure = APIFailure.PERMANENT
+            return None
+        try:
+            price = float(offer.get("price"))
+        except (TypeError, ValueError):
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        if price <= 0 or not math.isfinite(price):
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        currency = offer.get("currency")
+        if currency is not None and str(currency).upper() not in {"RUB", "RUR"}:
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        self.last_failure = None
+        return offer
+
+    def update_v2_offer_price(
+        self, offer_id: int, price: float
+    ) -> Optional[Dict[str, Any]]:
+        """PATCH one allowlisted RUB price once, then return its verified read-back."""
+        if (
+            getattr(self.config, "ggsel_v2_price_write_enabled", False) is not True
+            or isinstance(offer_id, bool)
+            or not isinstance(offer_id, int)
+            or offer_id <= 0
+            or isinstance(price, bool)
+            or not isinstance(price, (int, float))
+        ):
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        proposed_price = float(price)
+        targets = getattr(self.config, "repricing_targets_usd", {})
+        try:
+            max_change = float(
+                getattr(self.config, "repricing_max_change_percent", 15.0)
+            )
+        except (TypeError, ValueError):
+            max_change = math.nan
+        if (
+            not math.isfinite(proposed_price)
+            or proposed_price <= 0
+            or not isinstance(targets, dict)
+            or offer_id not in targets
+            or not math.isfinite(max_change)
+            or not 0 < max_change <= 100
+        ):
+            self.last_failure = APIFailure.PERMANENT
+            return None
+
+        with self._v2_price_write_lock:
+            current_offer = self.get_v2_offer(offer_id)
+            if current_offer is None:
+                return None
+            current_price = float(current_offer["price"])
+            if abs(proposed_price - current_price) / current_price * 100 > max_change:
+                self.last_failure = APIFailure.PERMANENT
+                return None
+            if math.isclose(
+                proposed_price, current_price, rel_tol=0.0, abs_tol=1e-9
+            ):
+                return current_offer
+
+            api_key = str(getattr(self.config, "ggsel_v2_api_key", "")).strip()
+            response = self._request(
+                "PATCH",
+                f"offers/{offer_id}",
+                base_url=self.V2_BASE_URL,
+                request_session=self._v2_write_session,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"price": proposed_price},
+                allow_redirects=False,
+            )
+            if response is None:
+                return None
+
+            verified_offer = self.get_v2_offer(offer_id)
+            if verified_offer is None or not math.isclose(
+                float(verified_offer["price"]),
+                proposed_price,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                self.last_failure = APIFailure.PERMANENT
+                return None
+            self.last_failure = None
+            return verified_offer
+
+    def get_real_product_name(self, item_id: int) -> Optional[str]:
+        """Fetch a product name without placing the auth token in the URL."""
+        item_id = self._positive_int(item_id)
+        if item_id is None:
+            self.last_failure = APIFailure.PERMANENT
+            return None
+        cached = self._product_name_cache.get(item_id)
+        if cached:
+            self.last_failure = None
+            return cached
+        product = self.get_product_info(item_id)
+        name = product.get("name") if product else None
+        if isinstance(name, str) and name.strip():
+            self._product_name_cache[item_id] = name.strip()
+            return self._product_name_cache[item_id]
+        return None
+
+
+def _diagnose_v2_offer() -> None:
+    parser = argparse.ArgumentParser(description="Read one GGSEL public-V2 offer")
+    parser.add_argument("offer_id", type=int)
+    args = parser.parse_args()
+    api = GGSelAPI(Config.from_env())
+    offer = api.get_v2_offer(args.offer_id)
+    if offer is None:
+        raise SystemExit(f"V2 GET failed: {api.last_failure or 'invalid response'}")
+    print(
+        f"offer_id={offer['id']} status={offer.get('status')} "
+        f"price={offer['price']} currency={offer.get('currency', 'RUB')}"
+    )
+
+
+if __name__ == "__main__":
+    _diagnose_v2_offer()
